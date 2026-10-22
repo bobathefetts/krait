@@ -76,7 +76,12 @@ inline Geometry geometry_from_gguf(const GgufFile& g) {
         throw std::runtime_error("nemotron_h: general.architecture is '" + (arch ? arch->s : std::string()) +
                                  "', expected 'nemotron_h_moe'");
     const std::string p = "nemotron_h_moe.";
-    auto U = [&](const char* k) { return (int) need(g, p + k).u; };
+    // review H1: refuse values that do not fit an int (u64 narrowing) instead of wrapping
+    auto U = [&](const char* k) {
+        const uint64_t v = need(g, p + k).u;
+        if (v > (uint64_t) (1u << 30)) throw std::runtime_error("nemotron_h: GGUF key '" + p + k + "' out of range");
+        return (int) v;
+    };
     Geometry m;
     m.n_block = U("block_count");
     m.n_mtp = g.get(p + "nextn_predict_layers") ? U("nextn_predict_layers") : 0;
@@ -91,6 +96,11 @@ inline Geometry geometry_from_gguf(const GgufFile& g) {
     m.ssm_d_state = U("ssm.state_size");
     m.ssm_n_group = U("ssm.group_count");
     m.ssm_n_head = U("ssm.time_step_rank");
+    // review H1: zero or inconsistent geometry is refused before any division or allocation uses it
+    if (m.n_block <= 0 || m.n_block > 4096 || m.n_layer <= 0 || m.n_mtp < 0 || m.n_embd <= 0 || m.n_vocab <= 0 ||
+        m.n_head <= 0 || m.head_dim <= 0 || m.ssm_d_conv <= 0 || m.ssm_d_inner <= 0 || m.ssm_d_state <= 0 ||
+        m.ssm_n_group <= 0 || m.ssm_n_head <= 0 || m.ssm_d_inner % m.ssm_n_head != 0 || m.ssm_d_inner % m.ssm_n_group != 0)
+        throw std::runtime_error("nemotron_h: zero or inconsistent model geometry in the GGUF metadata");
     m.ssm_head_dim = m.ssm_d_inner / m.ssm_n_head;
     m.ssm_d_in_proj = 2 * m.ssm_d_inner + 2 * m.ssm_n_group * m.ssm_d_state + m.ssm_n_head;   // nemotron-h.cpp:63
     m.ssm_conv_dim = m.ssm_d_inner + 2 * m.ssm_n_group * m.ssm_d_state;                       // nemotron-h.cpp:89
@@ -125,6 +135,8 @@ inline Geometry geometry_from_gguf(const GgufFile& g) {
             throw std::runtime_error("nemotron_h: per-layer feed_forward_length != expert_feed_forward_length");
     }
     if (m.expert_group_count > 1) throw std::runtime_error("nemotron_h: grouped expert routing is not implemented");
+    if (m.n_expert <= 0 || m.n_expert_used <= 0 || m.n_expert_used > m.n_expert || m.n_ff_exp <= 0 || m.moe_latent <= 0)
+        throw std::runtime_error("nemotron_h: zero or inconsistent expert geometry in the GGUF metadata");
     return m;
 }
 

@@ -74,6 +74,7 @@ std::vector<int32_t> read_i32(const std::string& p) {
     std::ifstream f(p, std::ios::binary);
     if (!f) throw std::runtime_error("cannot read " + p);
     std::string b((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    if (b.size() % 4) throw std::runtime_error(p + ": size is not a multiple of 4 bytes");
     std::vector<int32_t> v(b.size() / 4);
     std::memcpy(v.data(), b.data(), v.size() * 4);
     return v;
@@ -454,7 +455,19 @@ struct CacheCtx {
     size_t pool_bytes = 0;
     const ggml_type_traits_cpu* q8k_tr = nullptr;
     const ggml_type_traits_cpu* q80_tr = nullptr;
+    // review H4/M1: custom ops run inside ggml's worker threads and must not throw; the first CUDA failure is recorded
+    // here and the engine fails the request after graph compute (Engine::check_cache_error)
+    std::atomic<int> err{0};
+    char err_msg[256] = {0};
 };
+
+// record the first cache-path CUDA failure; returns true when the call succeeded
+inline bool cache_ok(CacheCtx& C, cudaError_t e, const char* what) {
+    if (e == cudaSuccess) return true;
+    int z = 0;
+    if (C.err.compare_exchange_strong(z, 1)) std::snprintf(C.err_msg, sizeof C.err_msg, "%s: %s", what, cudaGetErrorString(e));
+    return false;
+}
 
 double eff_score(const SlotPool& p, int e, int64_t step, double decay) {
     return p.score[(size_t) e] * std::pow(decay, (double) (step - p.last[(size_t) e]));
@@ -499,6 +512,7 @@ void launch_hits(CacheCtx& C, SlotPool& p, int n_hit) {
     nhx::k_relu2_q8_0<<<gq, 256, 0, C.s_hit>>>(C.d_upo, F, C.d_hq);
     if (dt == nhx::DownT::Q50) nhx::k_down<nhx::DownT::Q50><<<gd, 256, 0, C.s_hit>>>(wdn, C.d_hq, D, F / 32, p.dn_row, col, C.d_out);
     else nhx::k_down<nhx::DownT::IQ4NL><<<gd, 256, 0, C.s_hit>>>(wdn, C.d_hq, D, F / 32, p.dn_row, col, C.d_out);
+    cache_ok(C, cudaGetLastError(), "hit kernel launch");
 }
 
 // lo PLAN: src0 = latent [n_in, 1, T] f32, src1 = selected [22, T] i32 (a view); dst = plan bytes
@@ -552,11 +566,12 @@ void op_plan_lo(ggml_tensor* dst, int ith, int nth, void* ud) {
             col[h] = h;
         }
         std::memcpy(C.h_q8k, plan + PLAN_Q8K_OFF, (size_t) T * PLAN_Q8K_ROW);
-        cudaMemcpyAsync(C.d_args, C.h_args, ARGS_BYTES, cudaMemcpyHostToDevice, C.s_hit);
-        cudaMemcpyAsync(C.d_q8k, C.h_q8k, (size_t) T * PLAN_Q8K_ROW, cudaMemcpyHostToDevice, C.s_hit);
+        cache_ok(C, cudaMemcpyAsync(C.d_args, C.h_args, ARGS_BYTES, cudaMemcpyHostToDevice, C.s_hit), "hit args upload");
+        cache_ok(C, cudaMemcpyAsync(C.d_q8k, C.h_q8k, (size_t) T * PLAN_Q8K_ROW, cudaMemcpyHostToDevice, C.s_hit), "hit q8_K upload");
         launch_hits(C, p, n_hit);
-        cudaMemcpyAsync(C.h_out, C.d_out, (size_t) n_hit * C.n_in * sizeof(float), cudaMemcpyDeviceToHost, C.s_hit);
-        cudaEventRecord(C.ev_hit, C.s_hit);
+        cache_ok(C, cudaMemcpyAsync(C.h_out, C.d_out, (size_t) n_hit * C.n_in * sizeof(float), cudaMemcpyDeviceToHost, C.s_hit),
+                 "hit result download");
+        cache_ok(C, cudaEventRecord(C.ev_hit, C.s_hit), "hit event");
     }
     p.t_plan += now_s() - t0;
 }
@@ -642,11 +657,18 @@ void admit_lo(CacheCtx& C, SlotPool& p, const ggml_tensor* sel, const int32_t* p
         if (p.exp_of[(size_t) victim] >= 0) p.slot_of[(size_t) p.exp_of[(size_t) victim]] = -1;
         p.exp_of[(size_t) victim] = e;
         p.slot_of[(size_t) e] = victim;
-        cudaMemcpyAsync((uint8_t*) p.t_up->data + (size_t) victim * p.up_exp, p.host_up + (size_t) e * p.up_exp, p.up_exp,
-                        cudaMemcpyHostToDevice, C.s_copy);
-        cudaMemcpyAsync((uint8_t*) p.t_dn->data + (size_t) victim * p.dn_exp, p.host_dn + (size_t) e * p.dn_exp, p.dn_exp,
-                        cudaMemcpyHostToDevice, C.s_copy);
-        cudaEventRecord(p.ready[(size_t) victim], C.s_copy);
+        const bool ok =
+            cache_ok(C, cudaMemcpyAsync((uint8_t*) p.t_up->data + (size_t) victim * p.up_exp, p.host_up + (size_t) e * p.up_exp, p.up_exp,
+                                        cudaMemcpyHostToDevice, C.s_copy), "admission upload") &&
+            cache_ok(C, cudaMemcpyAsync((uint8_t*) p.t_dn->data + (size_t) victim * p.dn_exp, p.host_dn + (size_t) e * p.dn_exp, p.dn_exp,
+                                        cudaMemcpyHostToDevice, C.s_copy), "admission upload") &&
+            cache_ok(C, cudaEventRecord(p.ready[(size_t) victim], C.s_copy), "admission event");
+        if (!ok) {
+            // the slot holds nothing usable: forget the mapping (the request fails through the error flag)
+            p.slot_of[(size_t) e] = -1;
+            p.exp_of[(size_t) victim] = -1;
+            break;
+        }
         p.pending[(size_t) victim] = 1;
         p.pend_list.push_back(victim);
         in_use[(size_t) victim] = 1;
@@ -681,8 +703,7 @@ void op_down_lo(ggml_tensor* dst, int ith, int nth, void* ud) {
     }
     if (ith == 0) {
         const double t1 = now_s();
-        if (n_hit) {
-            cudaEventSynchronize(C.ev_hit);
+        if (n_hit && cache_ok(C, cudaEventSynchronize(C.ev_hit), "hit wait")) {
             for (int h = 0; h < n_hit; ++h)
                 std::memcpy(out + (size_t) pi[3 + NU_MAX + h] * C.n_in, C.h_out + (size_t) h * C.n_in, sizeof(float) * C.n_in);
         }
@@ -730,22 +751,29 @@ void op_plan_hi(ggml_tensor* dst, int ith, int nth, void* ud) {
                     s = j;
                 }
             }
-            if (s < 0) throw std::runtime_error("nh_engine: hi pool smaller than the experts of one step");
+            if (s < 0) {
+                // unreachable with init's cap >= n_used * NH_TMAX check; never throw inside a ggml op (review M1)
+                int z = 0;
+                if (C.err.compare_exchange_strong(z, 1)) std::snprintf(C.err_msg, sizeof C.err_msg, "hi pool smaller than one step's experts");
+                for (int kk = 0; kk < NK; ++kk)
+                    *(int32_t*) ((char*) ids + (size_t) (kk % C.n_used) * dst->nb[0] + (size_t) (kk / C.n_used) * dst->nb[1]) = 0;
+                return;
+            }
             if (p.exp_of[(size_t) s] >= 0) p.slot_of[(size_t) p.exp_of[(size_t) s]] = -1;
             p.exp_of[(size_t) s] = e;
             p.slot_of[(size_t) e] = s;
             in_use[(size_t) s] = 1;
-            cudaMemcpyAsync((uint8_t*) p.t_up->data + (size_t) s * p.up_exp, p.host_up + (size_t) e * p.up_exp, p.up_exp,
-                            cudaMemcpyHostToDevice, C.s_hi);
-            cudaMemcpyAsync((uint8_t*) p.t_dn->data + (size_t) s * p.dn_exp, p.host_dn + (size_t) e * p.dn_exp, p.dn_exp,
-                            cudaMemcpyHostToDevice, C.s_hi);
+            cache_ok(C, cudaMemcpyAsync((uint8_t*) p.t_up->data + (size_t) s * p.up_exp, p.host_up + (size_t) e * p.up_exp, p.up_exp,
+                                        cudaMemcpyHostToDevice, C.s_hi), "hi upload");
+            cache_ok(C, cudaMemcpyAsync((uint8_t*) p.t_dn->data + (size_t) s * p.dn_exp, p.host_dn + (size_t) e * p.dn_exp, p.dn_exp,
+                                        cudaMemcpyHostToDevice, C.s_hi), "hi upload");
             p.uploads++;
             up = true;
         }
         *(int32_t*) ((char*) ids + (size_t) (k % C.n_used) * dst->nb[0] + (size_t) (k / C.n_used) * dst->nb[1]) = s;
     }
     const double t1 = now_s();
-    if (up) cudaStreamSynchronize(C.s_hi);
+    if (up) cache_ok(C, cudaStreamSynchronize(C.s_hi), "hi upload wait");
     p.t_hi_upload += now_s() - t1;
     p.t_plan += t1 - t0;
 }
@@ -804,7 +832,10 @@ struct Engine {
     int64_t kv_len(int64_t n) const { return std::min<int64_t>(M.n_ctx, std::max<int64_t>(256, ((n + 255) / 256) * 256)); }
     int n_cpu_moe = 68;      // numerics split: experts of blocks < n_cpu_moe follow llama.cpp's CPU path
     bool pin = false;
-    long cache_mib = -1;     // -1: auto (keep the Gate 3 VRAM limit)
+    long cache_mib = -1;     // -1: auto (budget from free VRAM, see init_cache)
+    long vram_reserve_mib = 2048;   // review H3: VRAM left free after the expert pools
+    long vram_limit_mib = 0;        // optional cap on the process's total VRAM use (0: none)
+    std::vector<std::pair<uintptr_t, size_t>> pinned_ranges;   // cudaHostRegister'ed ranges (unregistered at teardown)
     int cap_lo = 0, cap_hi = 0;
     size_t pinned_bytes = 0;
     int n_threads = 16;
@@ -1290,14 +1321,19 @@ struct Engine {
                 break;
             }
             pinned_bytes += x.second - x.first;
+            pinned_ranges.push_back({x.first, x.second - x.first});
         }
         std::fprintf(stderr, "[nh_engine] page-locked %.1f MiB of host experts in %zu ranges\n", pinned_bytes / 1048576.0, mr.size());
     }
 
+    // vram_limit_used: 0, or a cap on the process's total VRAM use (bytes)
     void init_cache(size_t vram_limit_used) {
         g_cache = &C;
         C.on = true;
         C.n_used = W.g.n_expert_used;
+        // review C1: the cache's plan layout, scratch and CPU-exact kernels are written for this geometry; refuse others
+        if (C.n_used < 1 || C.n_used * NH_TMAX > NU_MAX)
+            throw std::runtime_error("nh_engine cache: expert_used_count " + std::to_string(C.n_used) + " > 22 is not supported; run with --cache off");
         int n_expert = 0;
         for (const LayerW& l : W.L)
             if (l.kind == nh::Kind::Moe) {
@@ -1316,7 +1352,9 @@ struct Engine {
         ck(cudaStreamCreateWithFlags(&C.s_hi, cudaStreamNonBlocking), "stream");
         ck(cudaEventCreateWithFlags(&C.ev_hit, cudaEventDisableTiming), "event");
         const size_t NU = NU_MAX, F = (size_t) C.n_ff, D = (size_t) C.n_in;
-        if (C.n_in != 1024) throw std::runtime_error("nh_engine cache: plan layout assumes a 1024-wide latent");
+        if (C.n_in != 1024 || C.n_ff <= 0 || C.n_ff % 32 != 0)
+            throw std::runtime_error("nh_engine cache: expert shape " + std::to_string(C.n_in) + "x" + std::to_string(C.n_ff) +
+                                     " is not supported (needs a 1024-wide latent and n_ff % 32 == 0); run with --cache off");
         ck(cudaMalloc(&C.d_args, ARGS_BYTES), "scratch");
         ck(cudaMalloc(&C.d_q8k, NH_TMAX * PLAN_Q8K_ROW), "scratch");
         ck(cudaMalloc(&C.d_upo, NU * F * 4), "scratch");
@@ -1327,10 +1365,13 @@ struct Engine {
         ck(cudaHostAlloc(&C.h_out, NU * D * 4, cudaHostAllocDefault), "pinned");
         // VRAM budget: what is free now minus what keeps the process under vram_limit_used, minus a margin for
         // CUDA graphs / cuBLAS workspaces that appear at the first decode
+        // review H3: budget = free VRAM (cudaMemGetInfo) - reserve; --vram-limit-mib additionally caps the process total
+        // (used + pools + a 384 MiB margin for CUDA graphs / cuBLAS workspaces that appear at the first decode)
         size_t fr = 0, tot = 0;
-        ggml_backend_dev_memory(ggml_backend_get_device(gpu), &fr, &tot);
-        const size_t used = tot - fr, margin = 384ull << 20;
-        size_t budget = used + margin < vram_limit_used ? vram_limit_used - used - margin : 0;
+        ck(cudaMemGetInfo(&fr, &tot), "cudaMemGetInfo");
+        const size_t used = tot - fr, margin = 384ull << 20, reserve = (size_t) std::max(0L, vram_reserve_mib) << 20;
+        size_t budget = fr > reserve ? fr - reserve : 0;
+        if (vram_limit_used) budget = std::min(budget, used + margin < vram_limit_used ? vram_limit_used - used - margin : 0);
         if (cache_mib >= 0) budget = std::min(budget, (size_t) cache_mib << 20);
         C.pools.resize((size_t) W.g.n_layer);
         size_t per_set = 0;
@@ -1341,6 +1382,26 @@ struct Engine {
             const bool lo = il < n_cpu_moe;
             if (!lo && !C.hi_on) continue;
             if (!ggml_backend_buffer_is_host(l.up_exps->buffer)) throw std::runtime_error("nh_engine cache: experts not host-mapped");
+            {
+                // review C1: every layer must match the shapes the scratch was sized for, and a lo pool needs the
+                // quant types the CPU-exact hit kernels implement (with ggml-cpu's matching vec_dot activation type);
+                // a layer that fails gets no pool and runs the plain llama.cpp path
+                std::string why;
+                const ggml_type tu = l.up_exps->type, td = l.down_exps->type;
+                if (l.up_exps->ne[0] != C.n_in || l.up_exps->ne[1] != C.n_ff || l.down_exps->ne[0] != C.n_ff ||
+                    l.down_exps->ne[1] != C.n_in || l.up_exps->ne[2] != n_expert || l.down_exps->ne[2] != n_expert)
+                    why = "expert shape differs from layer 0's";
+                else if (lo && !((tu == GGML_TYPE_Q4_K || tu == GGML_TYPE_Q5_K || tu == GGML_TYPE_Q6_K) &&
+                                 ggml_get_type_traits_cpu(tu)->vec_dot_type == GGML_TYPE_Q8_K))
+                    why = std::string("up type ") + ggml_type_name(tu) + " has no CPU-exact hit kernel";
+                else if (lo && !((td == GGML_TYPE_Q5_0 || td == GGML_TYPE_IQ4_NL) && ggml_get_type_traits_cpu(td)->vec_dot_type == GGML_TYPE_Q8_0))
+                    why = std::string("down type ") + ggml_type_name(td) + " has no CPU-exact hit kernel";
+                if (!why.empty()) {
+                    if (!lo) throw std::runtime_error("nh_engine cache: layer " + std::to_string(il) + ": " + why + "; run with --cache lo or off");
+                    std::fprintf(stderr, "[nh_engine] cache: layer %d not cached (%s)\n", il, why.c_str());
+                    continue;
+                }
+            }
             auto p = std::make_unique<SlotPool>();
             p->il = il;
             p->lo = lo;
@@ -1364,7 +1425,9 @@ struct Engine {
             if (!pp) continue;
             int cap = pp->lo ? (cap_lo > 0 ? cap_lo : cap_u) : (cap_hi > 0 ? cap_hi : cap_u);
             cap = std::min(cap, n_expert);
-            if (!pp->lo && cap < C.n_used) throw std::runtime_error("nh_engine cache: VRAM budget too small for the hi pools");
+            if (!pp->lo && cap < C.n_used * k_snap)
+                throw std::runtime_error("nh_engine cache: VRAM budget too small for the hi pools (need " + std::to_string(C.n_used * k_snap) +
+                                         " slots per layer, have " + std::to_string(cap) + "); lower --vram-reserve-mib or use --cache lo");
             pp->cap = cap;
             pp->t_up = ggml_new_tensor_3d(C.ctx, pp->tu, C.n_in, C.n_ff, std::max(cap, 1));
             pp->t_dn = ggml_new_tensor_3d(C.ctx, pp->td, C.n_ff, C.n_in, std::max(cap, 1));
@@ -1447,7 +1510,7 @@ struct Engine {
         if (!ggml_backend_sched_reserve(sched, gf)) throw std::runtime_error("nh_engine: sched reserve failed");
         ggml_free(ctx0);
         ctx0 = nullptr;
-        if (cache_mode) init_cache(29346ull << 20);
+        if (cache_mode) init_cache(vram_limit_mib > 0 ? (size_t) vram_limit_mib << 20 : 0);
     }
 
     void clear_slot(int slot) { M.n_past[(size_t) slot] = 0; }
@@ -1455,7 +1518,59 @@ struct Engine {
     // one ubatch of tokens for `slot`; all_out: logits for every token, else for the last one only
     // verify_: a speculative verify batch (all outputs; every token computed as a T == 1 step would compute it; the
     // recurrent states keep T rollback snapshots, see spec_commit).  want_h_: also return the result_norm rows (hrows).
+    void check_tokens(const int32_t* tok, int64_t T) const {
+        for (int64_t i = 0; i < T; ++i)
+            if (tok[i] < 0 || tok[i] >= W.g.n_vocab) throw std::runtime_error("nh_engine: token id " + std::to_string(tok[i]) + " out of range");
+    }
+
+    // review H4: fail the request if a cache op recorded a CUDA error during the last graph
+    void check_cache_error() {
+        if (C.err.load()) {
+            const std::string m = C.err_msg;
+            throw std::runtime_error("nh_engine: CUDA error in the expert cache: " + m);
+        }
+    }
+
+    Engine() = default;
+    Engine(const Engine&) = delete;
+    Engine& operator=(const Engine&) = delete;
+
+    // review M2: teardown in dependency order (streams idle -> cache scratch/pools -> unpin -> scheduler/buffers ->
+    // backends); the GGUF mapping is unmapped after this (main declares the model before the engine)
+    ~Engine() {
+        for (cudaStream_t st : {C.s_hit, C.s_copy, C.s_hi})
+            if (st) cudaStreamSynchronize(st);
+        if (sched) ggml_backend_sched_free(sched);
+        for (auto& pp : C.pools)
+            if (pp)
+                for (cudaEvent_t ev : pp->ready)
+                    if (ev) cudaEventDestroy(ev);
+        C.pools.clear();
+        if (C.buf) ggml_backend_buffer_free(C.buf);
+        if (C.ctx) ggml_free(C.ctx);
+        if (C.ev_hit) cudaEventDestroy(C.ev_hit);
+        for (cudaStream_t st : {C.s_hit, C.s_copy, C.s_hi})
+            if (st) cudaStreamDestroy(st);
+        for (void* d : {(void*) C.d_args, (void*) C.d_q8k, (void*) C.d_upo, (void*) C.d_hq, (void*) C.d_out})
+            if (d) cudaFree(d);
+        for (void* h : {(void*) C.h_args, (void*) C.h_q8k, (void*) C.h_out})
+            if (h) cudaFreeHost(h);
+        if (g_cache == &C) g_cache = nullptr;
+        for (auto& r : pinned_ranges) cudaHostUnregister((void*) r.first);
+        if (mtp_buf) ggml_backend_buffer_free(mtp_buf);
+        if (mtp_ctx) ggml_free(mtp_ctx);
+        if (M.buf) ggml_backend_buffer_free(M.buf);
+        if (M.ctx) ggml_free(M.ctx);
+        if (W.buf_gpu) ggml_backend_buffer_free(W.buf_gpu);
+        for (auto b : W.bufs_cpu) ggml_backend_buffer_free(b);
+        if (W.ctx_gpu) ggml_free(W.ctx_gpu);
+        if (W.ctx_cpu) ggml_free(W.ctx_cpu);
+        if (gpu) ggml_backend_free(gpu);
+        if (cpu) ggml_backend_free(cpu);
+    }
+
     void decode(const int32_t* tok, int64_t T, int slot, bool all_out, bool verify_ = false, bool want_h_ = false) {
+        check_tokens(tok, T);
         const int64_t pos0 = M.n_past[(size_t) slot];
         if (pos0 + T > M.n_ctx) throw std::runtime_error("nh_engine: context full");
         if (verify_ && (T > NH_TMAX || T > k_snap)) throw std::runtime_error("nh_engine: verify batch too large");
@@ -1507,6 +1622,7 @@ struct Engine {
         if (prof.on) prof.t_last = now_s();
         if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS)
             throw std::runtime_error("nh_engine: graph compute failed");
+        check_cache_error();
         const size_t nv = (size_t) gi.logits->ne[0];
         logits.resize(nv * (size_t) n_out);
         ggml_backend_tensor_get(gi.logits, logits.data(), 0, logits.size() * 4);
@@ -1530,6 +1646,7 @@ struct Engine {
         const int64_t E = g.n_embd, hd = g.head_dim;
         const int64_t n_head_q = w.wq->ne[1] / hd, n_head_kv = w.wk->ne[1] / hd;
         if (pos0 + T > M.n_ctx) throw std::runtime_error("nh_engine: MTP context full");
+        check_tokens(tok, T);
         const int64_t n_kv = kv_len(pos0 + T);
         ggml_backend_sched_reset(sched);
         ggml_backend_sched_set_eval_callback(sched, nullptr, nullptr);
@@ -1624,6 +1741,7 @@ struct Engine {
         cx.reset();
         ggml_backend_cpu_set_n_threads(cpu, n_threads);
         if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) throw std::runtime_error("nh_engine: MTP compute failed");
+        check_cache_error();
         mtp_logits.resize((size_t) lg->ne[0]);
         ggml_backend_tensor_get(lg, mtp_logits.data(), 0, mtp_logits.size() * 4);
         mtp_h.resize((size_t) E);
@@ -1869,12 +1987,12 @@ std::set<std::string> split_ids(const std::string& s) {
 
 }  // namespace
 
-int main(int argc, char** argv) {
+int real_main(int argc, char** argv) {
     std::string model, list, tokdir, outdir, force, only, dump_sums, dump_prompt, bench, bench_out;
     int profile = 0;
     bool pin = false;
     int cache_mode = 0, cap_lo = 0, cap_hi = 0, max_admit = 2;
-    long cache_mib = -1;
+    long cache_mib = -1, vram_reserve_mib = 2048, vram_limit_mib = 0;
     double cache_decay = 0.97;
     SpecCfg spec;
     bool spec_check = false;
@@ -1910,6 +2028,8 @@ int main(int argc, char** argv) {
             if (cache_mode < 0) { std::fprintf(stderr, "--cache lo|all|off\n"); return 2; }
         }
         else if (a == "--cache-mib") cache_mib = std::stol(nx());
+        else if (a == "--vram-reserve-mib") vram_reserve_mib = std::stol(nx());
+        else if (a == "--vram-limit-mib") vram_limit_mib = std::stol(nx());
         else if (a == "--cap-lo") cap_lo = std::stoi(nx());
         else if (a == "--cap-hi") cap_hi = std::stoi(nx());
         else if (a == "--cache-decay") cache_decay = std::stod(nx());
@@ -1936,16 +2056,27 @@ int main(int argc, char** argv) {
                              "[--dump-sums FILE --dump-prompt ID]\n       strata-nh-engine --model SHARD --bench FILE --bench-out JSONL "
                              "[--profile NTOK] [--chunk 512] [--ctx 32768] [--threads 16] [--n-cpu-moe 68]\n"
                              "       either: [--pin] [--cache lo|all|off] [--cache-mib N] [--cap-lo N] [--cap-hi N] "
-                             "[--cache-decay 0.97] [--max-admit 2]\n");
+                             "[--cache-decay 0.97] [--max-admit 2] [--vram-reserve-mib 2048] [--vram-limit-mib N]\n"
+                             "       [--spec off|ngram|mtp|auto] [--spec-k 1..3] [--spec-min-acc X] [--mtp-topk N] [--spec-check]\n");
         return 2;
     }
     const std::set<std::string> only_ids = split_ids(only);
     const double t_load0 = now_s();
     const strata::GgufModel gm = strata::GgufModel::open(model);
     const nh::Model m = nh::load_model(gm);
+    if (!m.report.pass()) {
+        // review H1: a GGUF whose tensors do not match the expected layout (missing, wrong shape/type, payload outside
+        // the file) is refused before anything reads it
+        for (const auto& e : m.report.errors) std::fprintf(stderr, "[nh_engine] layout: %s\n", e.c_str());
+        std::fprintf(stderr, "[nh_engine] GGUF layout check failed (%d expected, %d found, %d ok, %d in file); refusing to run\n",
+                     m.report.expected, m.report.found, m.report.ok, m.report.in_file);
+        return 3;
+    }
     Engine E;
     E.pin = pin;
     E.cache_mib = cache_mib;
+    E.vram_reserve_mib = vram_reserve_mib;
+    E.vram_limit_mib = vram_limit_mib;
     E.cap_lo = cap_lo;
     E.cap_hi = cap_hi;
     E.C.decay = cache_decay;
@@ -1977,8 +2108,10 @@ int main(int argc, char** argv) {
         SpecStats sst;
         long spec_check_bad = 0;
         while (bf >> name >> npred >> igeos >> reps >> ntok) {
+            if (ntok <= 0 || ntok >= ctx || npred < 1 || reps < 1) throw std::runtime_error("bench line " + name + ": bad n_tok/n_predict/reps");
             std::vector<int32_t> pt((size_t) ntok);
-            for (int i = 0; i < ntok; ++i) bf >> pt[(size_t) i];
+            for (int i = 0; i < ntok; ++i)
+                if (!(bf >> pt[(size_t) i])) throw std::runtime_error("bench line " + name + ": fewer tokens than n_tok");
             if (spec_diff > 0) {
                 // T plain steps (greedy chain) vs one verify batch of the same T tokens, node by node
                 const int T = spec_diff;
@@ -2093,6 +2226,7 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "[profile] %s: %d tokens, %.3f ms/token in callbacks\n", name.c_str(), profile, tot * 1e3 / profile);
                     for (auto& x : v) std::fprintf(stderr, "[profile] %9.3f ms/tok\t%s\n", x.first * 1e3 / profile, x.second.c_str());
                     E.prof.agg.clear();
+                    std::fprintf(stderr, "[profile] %s rep %d: profile run, no bench JSONL row written\n", name.c_str(), rep);
                     continue;
                 }
                 const int ng = (int) out.size();
@@ -2136,6 +2270,7 @@ int main(int argc, char** argv) {
         if (!force.empty()) maxgen = (int) forced.size();
         E.clear_slot(0);
         E.dump.f = (!dump_sums.empty() && id == dump_prompt) ? std::fopen(dump_sums.c_str(), "w") : nullptr;
+        if (!dump_sums.empty() && id == dump_prompt && !E.dump.f) throw std::runtime_error("cannot write " + dump_sums);
         std::vector<Row> rows;
         rows.reserve((size_t) np + (size_t) maxgen);
         std::vector<float> last((size_t) nv);
@@ -2186,6 +2321,7 @@ int main(int argc, char** argv) {
         const double t2 = now_s();
         auto op = [&](const char* s) { return std::fopen((outdir + "/" + id + s).c_str(), "wb"); };
         FILE *fi = op(".topk_ids.i32"), *fl = op(".topk_logits.f32"), *fs = op(".lse.f32"), *ft = op(".target_lp.f32");
+        if (!fi || !fl || !fs || !ft) throw std::runtime_error("cannot write capture files for " + id + " in " + outdir);
         for (const Row& r : rows) {
             std::fwrite(r.ids.data(), 4, (size_t) K, fi);
             std::fwrite(r.lg.data(), 4, (size_t) K, fl);
@@ -2197,6 +2333,7 @@ int main(int argc, char** argv) {
         std::fclose(fs);
         std::fclose(ft);
         FILE* fo = op(".out.i32");
+        if (!fo) throw std::runtime_error("cannot write " + outdir + "/" + id + ".out.i32");
         std::fwrite(out.data(), 4, out.size(), fo);
         std::fclose(fo);
         std::fprintf(sumf, "%s n_prompt=%d n_out=%zu rows=%zu eog=%d prompt_s=%.3f gen_s=%.3f\n", id.c_str(), np,
@@ -2209,4 +2346,14 @@ int main(int argc, char** argv) {
     E.cache_stats(stderr);
     if (spec.mode) print_spec_stats(cap_sst, stderr);
     return 0;
+}
+
+// review M1: report every error with its message and a non-zero exit instead of std::terminate
+int main(int argc, char** argv) {
+    try {
+        return real_main(argc, argv);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "strata-nh-engine: error: %s\n", e.what());
+        return 1;
+    }
 }
