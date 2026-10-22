@@ -136,7 +136,18 @@ struct LayerW {
                 *up_exps = nullptr, *down_exps = nullptr, *up_shexp = nullptr, *down_shexp = nullptr;
 };
 
+// the MTP / NextN head (blk.88; nemotron-h-moe.cpp graph_mtp).  Dense tensors in VRAM, routed experts host-mapped
+// (computed by ggml-cpu at draft batch sizes: drafts need not be exact, the verify step is)
+struct MtpW {
+    ggml_tensor *enorm = nullptr, *hnorm = nullptr, *eh_proj = nullptr, *attn_norm = nullptr, *wq = nullptr, *wk = nullptr,
+                *wv = nullptr, *wo = nullptr, *post_attn_norm = nullptr, *gate_inp = nullptr, *exp_probs_b = nullptr,
+                *latent_down = nullptr, *latent_up = nullptr, *up_exps = nullptr, *down_exps = nullptr, *up_shexp = nullptr,
+                *down_shexp = nullptr, *shared_head_norm = nullptr;
+};
+
 struct Weights {
+    MtpW mtp;
+    bool has_mtp = false;
     nh::Geometry g;
     ggml_context* ctx_gpu = nullptr;
     ggml_context* ctx_cpu = nullptr;
@@ -151,10 +162,10 @@ struct Weights {
 // Placement as llama.cpp with `-ngl 99 --n-cpu-moe N` (common/arg.cpp: the override pattern
 // blk\.(0..N-1)\.ffn_(up|down|gate|gate_up)_exps -> CPU; with mmap these become CPU_Mapped buffers, and token_embd is
 // an input-layer tensor on the CPU: llama-model.cpp dev_input).
-void load_weights(const nh::Model& m, int n_cpu_moe, ggml_backend_buffer_type_t buft_gpu, Weights& W) {
+void load_weights(const nh::Model& m, int n_cpu_moe, ggml_backend_buffer_type_t buft_gpu, Weights& W, bool with_mtp = false) {
     W.g = m.g;
     const int nl = m.g.n_layer;
-    const size_t n_t = 8 + (size_t) nl * 24;
+    const size_t n_t = 8 + (size_t) (nl + 1) * 24;
     ggml_init_params ip{ggml_tensor_overhead() * n_t, nullptr, true};
     W.ctx_gpu = ggml_init(ip);
     W.ctx_cpu = ggml_init(ip);
@@ -201,6 +212,35 @@ void load_weights(const nh::Model& m, int n_cpu_moe, ggml_backend_buffer_type_t 
         d.up_exps = mk(s.up_exps, exps_cpu);
         d.down_shexp = mk(s.down_shexp, false);
         d.up_shexp = mk(s.up_shexp, false);
+    }
+    if (with_mtp) {
+        if ((int) m.layers.size() <= nl || m.layers[(size_t) nl].kind != nh::Kind::Mtp)
+            throw std::runtime_error("nh_engine: --spec mtp needs the MTP block (blk." + std::to_string(nl) + ")");
+        const nh::Layer& s = m.layers[(size_t) nl];
+        MtpW& d = W.mtp;
+        d.enorm = mk(s.enorm, false);
+        d.hnorm = mk(s.hnorm, false);
+        d.eh_proj = mk(s.eh_proj, false);
+        d.attn_norm = mk(s.attn_norm, false);
+        d.wq = mk(s.wq, false);
+        d.wk = mk(s.wk, false);
+        d.wv = mk(s.wv, false);
+        d.wo = mk(s.wo, false);
+        d.post_attn_norm = mk(s.post_attn_norm, false);
+        d.gate_inp = mk(s.gate_inp, false);
+        d.exp_probs_b = mk(s.exp_probs_b, false);
+        d.latent_down = mk(s.latent_down, false);
+        d.latent_up = mk(s.latent_up, false);
+        d.up_exps = mk(s.up_exps, true);
+        d.down_exps = mk(s.down_exps, true);
+        d.up_shexp = mk(s.up_shexp, false);
+        d.down_shexp = mk(s.down_shexp, false);
+        d.shared_head_norm = mk(s.shared_head_norm, false);
+        for (ggml_tensor* t : {d.enorm, d.hnorm, d.eh_proj, d.attn_norm, d.wq, d.wk, d.wv, d.wo, d.post_attn_norm, d.gate_inp,
+                               d.exp_probs_b, d.latent_down, d.latent_up, d.up_exps, d.down_exps, d.up_shexp, d.down_shexp,
+                               d.shared_head_norm})
+            if (!t) throw std::runtime_error("nh_engine: MTP block tensor missing");
+        W.has_mtp = true;
     }
     W.buf_gpu = ggml_backend_alloc_ctx_tensors_from_buft(W.ctx_gpu, buft_gpu);
     if (!W.buf_gpu) throw std::runtime_error("nh_engine: VRAM allocation of the weights failed");
@@ -754,6 +794,13 @@ struct Engine {
     int64_t vpos0 = 0;
     int k_snap = 1;                 // recurrent-state rows per slot: 1 + rollback snapshots
     std::vector<float> hrows;       // result_norm rows of the last decode (want_h)
+    // MTP draft head
+    bool mtp_on = false;
+    int mtp_topk = 0;               // experts per draft token (0: the model's n_expert_used)
+    ggml_tensor *mtp_k = nullptr, *mtp_v = nullptr;
+    ggml_context* mtp_ctx = nullptr;
+    ggml_backend_buffer_t mtp_buf = nullptr;
+    std::vector<float> mtp_logits, mtp_h;   // last row of the last MTP call
     int64_t kv_len(int64_t n) const { return std::min<int64_t>(M.n_ctx, std::max<int64_t>(256, ((n + 255) / 256) * 256)); }
     int n_cpu_moe = 68;      // numerics split: experts of blocks < n_cpu_moe follow llama.cpp's CPU path
     bool pin = false;
@@ -1373,7 +1420,18 @@ struct Engine {
         ggml_backend_cpu_set_n_threads(cpu, n_threads);
         C.hi_on = cache_mode == 2;
         // cache mode 2 keeps every routed expert in host memory (the VRAM of the resident blocks becomes slot pools)
-        load_weights(m, cache_mode == 2 ? m.g.n_layer : n_cpu_moe, ggml_backend_get_default_buffer_type(gpu), W);
+        load_weights(m, cache_mode == 2 ? m.g.n_layer : n_cpu_moe, ggml_backend_get_default_buffer_type(gpu), W, mtp_on);
+        if (mtp_on) {
+            // the MTP head's own KV cache (dense NoPE attention), one sequence
+            ggml_init_params mp{ggml_tensor_overhead() * 4, nullptr, true};
+            mtp_ctx = ggml_init(mp);
+            const int64_t n_embd_kv_m = W.mtp.wk->ne[1];
+            mtp_k = ggml_new_tensor_2d(mtp_ctx, GGML_TYPE_F16, n_embd_kv_m, n_ctx);
+            mtp_v = ggml_new_tensor_2d(mtp_ctx, GGML_TYPE_F16, n_embd_kv_m, n_ctx);
+            mtp_buf = ggml_backend_alloc_ctx_tensors(mtp_ctx, gpu);
+            if (!mtp_buf) throw std::runtime_error("nh_engine: VRAM allocation of the MTP KV cache failed");
+            ggml_backend_buffer_clear(mtp_buf, 0);
+        }
         if (pin) pin_experts();
         init_memory(n_slots, n_ctx);
         ggml_backend_t backs[2] = {gpu, cpu};
@@ -1402,7 +1460,7 @@ struct Engine {
         if (pos0 + T > M.n_ctx) throw std::runtime_error("nh_engine: context full");
         if (verify_ && (T > NH_TMAX || T > k_snap)) throw std::runtime_error("nh_engine: verify batch too large");
         verify = verify_ && T > 1;
-        want_h = want_h_;
+        want_h = want_h_ || mtp_on;
         vpos0 = pos0;
         if (verify_) all_out = true;
         if (C.on && (T == 1 || verify)) C.step++;
@@ -1463,6 +1521,117 @@ struct Engine {
         M.n_past[(size_t) slot] = (int) (pos0 + T);
     }
 
+    // MTP head over T (h, token) pairs written to MTP KV cells pos0..pos0+T-1 (graph_mtp of nemotron-h-moe.cpp): h_j is
+    // the main model's result_norm row of position j and tok the token at j + 1.  Leaves the last row's logits (the draft
+    // for position j + 2) and its h_nextn (the h of a chained step) in mtp_logits / mtp_h.
+    void mtp_decode(const int32_t* tok, const float* h, int64_t T, int64_t pos0) {
+        const MtpW& w = W.mtp;
+        const nh::Geometry& g = W.g;
+        const int64_t E = g.n_embd, hd = g.head_dim;
+        const int64_t n_head_q = w.wq->ne[1] / hd, n_head_kv = w.wk->ne[1] / hd;
+        if (pos0 + T > M.n_ctx) throw std::runtime_error("nh_engine: MTP context full");
+        const int64_t n_kv = kv_len(pos0 + T);
+        ggml_backend_sched_reset(sched);
+        ggml_backend_sched_set_eval_callback(sched, nullptr, nullptr);
+        ggml_init_params ip{meta.size(), meta.data(), true};
+        ctx0 = ggml_init(ip);
+        gf = ggml_new_graph_custom(ctx0, max_nodes, false);
+        ggml_tensor* tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T);
+        ggml_set_input(tokens);
+        ggml_tensor* hin = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, E, T);
+        ggml_set_input(hin);
+        ggml_tensor* kidx = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, T);
+        ggml_set_input(kidx);
+        ggml_tensor* mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, n_kv, T, 1, 1);
+        ggml_set_input(mask);
+        ggml_tensor* emb = ggml_get_rows(ctx0, W.tok_embd, tokens);
+        auto rms = [&](ggml_tensor* x, ggml_tensor* wt) { return ggml_mul(ctx0, ggml_rms_norm(ctx0, x, g.rms_eps), wt); };
+        ggml_tensor* e_norm = rms(emb, w.enorm);
+        ggml_tensor* h_norm = rms(hin, w.hnorm);
+        ggml_tensor* cur = ggml_mul_mat(ctx0, w.eh_proj, ggml_concat(ctx0, e_norm, h_norm, 0));
+        ggml_tensor* inpSA = cur;
+        cur = rms(cur, w.attn_norm);
+        {
+            ggml_tensor* Q = ggml_reshape_3d(ctx0, ggml_mul_mat(ctx0, w.wq, cur), hd, n_head_q, T);
+            ggml_tensor* K = ggml_mul_mat(ctx0, w.wk, cur);
+            ggml_tensor* V = ggml_mul_mat(ctx0, w.wv, cur);
+            ggml_build_forward_expand(gf, ggml_set_rows(ctx0, mtp_k, K, kidx));
+            ggml_build_forward_expand(gf, ggml_set_rows(ctx0, mtp_v, V, kidx));
+            ggml_tensor* k = ggml_view_3d(ctx0, mtp_k, hd, n_head_kv, n_kv, ggml_row_size(mtp_k->type, hd), mtp_k->nb[1], 0);
+            ggml_tensor* v = ggml_view_3d(ctx0, mtp_v, hd, n_head_kv, n_kv, ggml_row_size(mtp_v->type, hd), mtp_v->nb[1], 0);
+            ggml_tensor* q = ggml_permute(ctx0, Q, 0, 2, 1, 3);
+            k = ggml_permute(ctx0, k, 0, 2, 1, 3);
+            v = ggml_permute(ctx0, v, 0, 2, 1, 3);
+            ggml_tensor* o = ggml_flash_attn_ext(ctx0, q, k, v, mask, 1.0f / std::sqrt((float) hd), 0.0f, 0.0f);
+            ggml_prec_set_acc(o, GGML_PREC_F32);
+            o = ggml_reshape_2d(ctx0, o, o->ne[0] * o->ne[1], o->ne[2] * o->ne[3]);
+            cur = ggml_mul_mat(ctx0, w.wo, o);
+        }
+        cur = ggml_add(ctx0, cur, inpSA);
+        // only the last row goes on (crop_before_nextn)
+        cur = ggml_view_2d(ctx0, cur, E, 1, cur->nb[1], (size_t) (T - 1) * cur->nb[1]);
+        ggml_tensor* ffn_res = cur;
+        cur = rms(cur, w.post_attn_norm);
+        {
+            ggml_tensor* logits_r = ggml_mul_mat(ctx0, w.gate_inp, cur);
+            ggml_tensor* tmp = ggml_mul_mat(ctx0, w.up_shexp, cur);
+            ggml_tensor* sh = ggml_mul_mat(ctx0, w.down_shexp, ggml_sqr(ctx0, ggml_relu(ctx0, tmp)));
+            ggml_tensor* lat = ggml_mul_mat(ctx0, w.latent_down, cur);
+            const int64_t n_expert = w.up_exps->ne[2];
+            const int64_t n_used = mtp_topk > 0 ? std::min<int64_t>(mtp_topk, g.n_expert_used) : g.n_expert_used;
+            ggml_tensor* probs = ggml_sigmoid(ctx0, logits_r);
+            ggml_tensor* selected = ggml_argsort_top_k(ctx0, ggml_add(ctx0, probs, w.exp_probs_b), (int) n_used);
+            ggml_tensor* wts = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, probs, 1, n_expert, 1), selected);
+            if (g.expert_weights_norm) {
+                wts = ggml_reshape_2d(ctx0, wts, n_used, 1);
+                ggml_tensor* sum = ggml_clamp(ctx0, ggml_sum_rows(ctx0, wts), 6.103515625e-5, INFINITY);
+                wts = ggml_reshape_3d(ctx0, ggml_div(ctx0, wts, sum), 1, n_used, 1);
+            }
+            if (g.expert_weights_scale != 0.0f && g.expert_weights_scale != 1.0f) wts = ggml_scale(ctx0, wts, g.expert_weights_scale);
+            const int64_t n_lat = lat->ne[0];
+            ggml_tensor* x3 = ggml_reshape_3d(ctx0, lat, n_lat, 1, 1);
+            ggml_tensor* up = ggml_mul_mat_id(ctx0, w.up_exps, x3, selected);
+            ggml_tensor* ex = ggml_mul_mat_id(ctx0, w.down_exps, ggml_sqr(ctx0, ggml_relu(ctx0, up)), selected);
+            ggml_backend_sched_set_tensor_backend(sched, up, cpu);
+            ggml_backend_sched_set_tensor_backend(sched, ex, cpu);
+            ex = ggml_mul(ctx0, ex, wts);
+            ggml_tensor* moe = ggml_view_2d(ctx0, ex, n_lat, 1, ex->nb[2], 0);
+            for (int64_t i = 1; i < n_used; ++i) moe = ggml_add(ctx0, moe, ggml_view_2d(ctx0, ex, n_lat, 1, ex->nb[2], (size_t) i * ex->nb[1]));
+            if (n_used == 1) moe = ggml_cont(ctx0, moe);
+            moe = ggml_mul_mat(ctx0, w.latent_up, moe);
+            cur = ggml_add(ctx0, moe, sh);
+        }
+        cur = ggml_add(ctx0, cur, ffn_res);
+        ggml_tensor* hn = ggml_mul(ctx0, ggml_norm(ctx0, cur, g.norm_eps), w.shared_head_norm);
+        ggml_set_output(hn);
+        ggml_tensor* lg = ggml_mul_mat(ctx0, W.output, hn);
+        ggml_set_output(lg);
+        ggml_build_forward_expand(gf, hn);
+        ggml_build_forward_expand(gf, lg);
+        if (!ggml_backend_sched_alloc_graph(sched, gf)) throw std::runtime_error("nh_engine: MTP graph alloc failed");
+        ggml_backend_tensor_set(tokens, tok, 0, (size_t) T * 4);
+        ggml_backend_tensor_set(hin, h, 0, (size_t) (T * E) * 4);
+        {
+            std::vector<int64_t> idx((size_t) T);
+            for (int64_t i = 0; i < T; ++i) idx[(size_t) i] = pos0 + i;
+            ggml_backend_tensor_set(kidx, idx.data(), 0, idx.size() * 8);
+            std::vector<ggml_fp16_t> mk((size_t) (n_kv * T));
+            const ggml_fp16_t keep = ggml_fp32_to_fp16(0.0f), drop = ggml_fp32_to_fp16(-INFINITY);
+            for (int64_t i = 0; i < T; ++i)
+                for (int64_t j = 0; j < n_kv; ++j) mk[(size_t) (i * n_kv + j)] = j <= pos0 + i ? keep : drop;
+            ggml_backend_tensor_set(mask, mk.data(), 0, mk.size() * sizeof(ggml_fp16_t));
+        }
+        cx.reset();
+        ggml_backend_cpu_set_n_threads(cpu, n_threads);
+        if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) throw std::runtime_error("nh_engine: MTP compute failed");
+        mtp_logits.resize((size_t) lg->ne[0]);
+        ggml_backend_tensor_get(lg, mtp_logits.data(), 0, mtp_logits.size() * 4);
+        mtp_h.resize((size_t) E);
+        ggml_backend_tensor_get(hn, mtp_h.data(), 0, mtp_h.size() * 4);
+        ggml_free(ctx0);
+        ctx0 = nullptr;
+    }
+
     // after a verify batch of T tokens at pos0: keep the first a (1 <= a <= T).  The KV cells past pos0 + a stay but are
     // masked; the recurrent states go back to the snapshot taken after token a - 1 (snapshot row T - a, ssm-scan.cu)
     void spec_commit(int slot, int64_t pos0, int T, int a) {
@@ -1491,6 +1660,7 @@ struct SpecStats {
     double t_draft = 0, t_verify = 0, t_plain = 0, t_commit = 0;
     double t_by_T[NH_TMAX + 1] = {};
     long n_by_T[NH_TMAX + 1] = {};
+    long mtp_calls = 0, mtp_rows = 0, mtp_first_total = 0, mtp_first_ok = 0;
 };
 
 // most recent earlier occurrence of the last n context tokens (n = nmax .. nmin), and up to k tokens that followed it
@@ -1517,16 +1687,27 @@ struct SpecCfg {
     int mode = 0;        // 0 off, 1 ngram, 2 mtp, 3 auto (both)
     int k = 3;           // max drafts per step (verify batch = k + 1 <= NH_TMAX)
     int ng_min = 2, ng_max = 4;
+    int ng_strong = 3;   // auto: an n-gram match at least this long wins over the MTP draft
 };
 
-// Generation after the prompt: `last` = logits of the last prompt token.  Emits tokens (and, through on_row, the logits
-// row that predicted each one) exactly as the plain loop does: same tokens, same rows, same stop rules.
+// Generation after the prompt: `last` = logits of the last prompt token (and, with the MTP head, E.hrows = its
+// result_norm row).  Emits tokens (and, through on_row, the logits row that predicted each one) exactly as the plain
+// loop does: same tokens, same rows, same stop rules.
 template <class OnRow>
 void spec_generate(Engine& E, const SpecCfg& cfg, SpecStats& st, std::vector<int32_t> ctx_toks, std::vector<float> last,
                    int maxgen, bool stop_eog, const std::set<int>& eog, std::vector<int32_t>& out, OnRow on_row,
                    std::vector<double>* t_tok) {
     const int nv = (int) last.size();
-    std::vector<float> row((size_t) nv);
+    const int64_t ne = E.W.g.n_embd;
+    const bool use_mtp = E.mtp_on && (cfg.mode == 2 || cfg.mode == 3);
+    // MTP inputs not yet run through the head: pairs (h_j, token_{j+1}); h_last = h of the row that predicted x
+    std::vector<float> pend_h, h_last;
+    std::vector<int32_t> pend_t;
+    int64_t mtp_pos = 0;
+    if (use_mtp) {
+        if (E.hrows.size() < (size_t) ne) throw std::runtime_error("spec: no h rows from the prompt");
+        h_last.assign(E.hrows.end() - ne, E.hrows.end());
+    }
     for (;;) {
         const int x = argmax(last.data(), nv);
         on_row(last.data(), x);
@@ -1535,16 +1716,60 @@ void spec_generate(Engine& E, const SpecCfg& cfg, SpecStats& st, std::vector<int
         if (t_tok) t_tok->push_back(now_s());
         if ((stop_eog && eog.count(x)) || (int) out.size() >= maxgen) break;
         const double td0 = now_s();
-        int nm = 0;
-        std::vector<int32_t> d;
         const int kmax = std::min(cfg.k, std::min(NH_TMAX - 1, maxgen - (int) out.size()));
-        if (kmax > 0 && (cfg.mode == 1 || cfg.mode == 3)) d = ngram_propose(ctx_toks, kmax, cfg.ng_min, cfg.ng_max, &nm);
+        int nm = 0;
+        std::vector<int32_t> dn, dm, d;
+        if (kmax > 0 && (cfg.mode == 1 || cfg.mode == 3)) dn = ngram_propose(ctx_toks, kmax, cfg.ng_min, cfg.ng_max, &nm);
+        if (use_mtp) {
+            pend_h.insert(pend_h.end(), h_last.begin(), h_last.end());
+            pend_t.push_back(x);
+            if (kmax > 0) {
+                const int64_t n = (int64_t) pend_t.size();
+                E.mtp_decode(pend_t.data(), pend_h.data(), n, mtp_pos);
+                st.mtp_calls++;
+                st.mtp_rows += n;
+                mtp_pos += n;
+                pend_t.clear();
+                pend_h.clear();
+                dm.push_back(argmax(E.mtp_logits.data(), nv));
+                for (int j = 1; j < kmax; ++j) {
+                    // chained draft: the head's own h_nextn with its last draft, in a scratch cell past the committed ones
+                    std::vector<float> hc = E.mtp_h;
+                    E.mtp_decode(&dm.back(), hc.data(), 1, mtp_pos + j - 1);
+                    st.mtp_calls++;
+                    st.mtp_rows++;
+                    dm.push_back(argmax(E.mtp_logits.data(), nv));
+                }
+            }
+        }
+        int src = -1;
+        if (cfg.mode == 1) {
+            d = dn;
+            src = 0;
+        } else if (cfg.mode == 2) {
+            d = dm;
+            src = 1;
+        } else if (cfg.mode == 3) {
+            // prefer the n-gram continuation when it is a long match or agrees with the head's first draft
+            if (!dn.empty() && (nm >= cfg.ng_strong || (!dm.empty() && dn[0] == dm[0]))) {
+                d = dn;
+                src = (!dm.empty() && dn[0] == dm[0]) ? 2 : 0;
+            } else {
+                d = dm;
+                src = 1;
+            }
+        }
         st.t_draft += now_s() - td0;
         const int64_t pos0 = E.M.n_past[0];
         if (d.empty()) {
             const double t0 = now_s();
             E.decode(&out.back(), 1, 0, false);
             std::memcpy(last.data(), E.logits.data(), sizeof(float) * (size_t) nv);
+            if (use_mtp) {
+                // (h_last, x) was queued above but not run (no drafting this step): keep it queued, h_last = new row
+                if (kmax > 0) { /* ran above */ }
+                h_last.assign(E.hrows.begin(), E.hrows.begin() + ne);
+            }
             st.plain_steps++;
             st.t_plain += now_s() - t0;
             st.t_by_T[1] += now_s() - t0;
@@ -1561,8 +1786,13 @@ void spec_generate(Engine& E, const SpecCfg& cfg, SpecStats& st, std::vector<int
         st.n_by_T[T]++;
         st.steps++;
         st.drafted += T - 1;
-        st.src_drafted[0] += T - 1;
-        st.src_steps[0]++;
+        st.src_drafted[src] += T - 1;
+        st.src_steps[src]++;
+        // the MTP head's own first-draft accuracy (whatever source was verified)
+        if (!dm.empty()) {
+            st.mtp_first_total++;
+            if (dm[0] == argmax(E.logits.data(), nv)) st.mtp_first_ok++;
+        }
         int a = 1;
         bool stop = false;
         for (int i = 0; i < T - 1; ++i) {
@@ -1579,10 +1809,18 @@ void spec_generate(Engine& E, const SpecCfg& cfg, SpecStats& st, std::vector<int
             }
         }
         st.accepted += a - 1;
-        st.src_accepted[0] += a - 1;
+        st.src_accepted[src] += a - 1;
         st.acc_hist[a - 1]++;
         if (stop) break;
         std::memcpy(last.data(), E.logits.data() + (size_t) (a - 1) * nv, sizeof(float) * (size_t) nv);
+        if (use_mtp) {
+            // committed rows pos0 .. pos0+a-1: pairs (h_{pos0+i}, d_{i+1}) for i < a-1 wait for the next head call
+            for (int i = 0; i + 1 < a; ++i) {
+                pend_h.insert(pend_h.end(), E.hrows.begin() + (size_t) i * ne, E.hrows.begin() + (size_t) (i + 1) * ne);
+                pend_t.push_back(d[(size_t) i]);
+            }
+            h_last.assign(E.hrows.begin() + (size_t) (a - 1) * ne, E.hrows.begin() + (size_t) a * ne);
+        }
         const double tc = now_s();
         E.spec_commit(0, pos0, T, a);
         st.t_commit += now_s() - tc;
@@ -1600,6 +1838,10 @@ void print_spec_stats(const SpecStats& st, FILE* f) {
             std::fprintf(f, "[spec] source %s: steps %ld drafted %ld accepted %ld rate %.4f\n", nm[s], st.src_steps[s], st.src_drafted[s],
                          st.src_accepted[s], st.src_drafted[s] ? (double) st.src_accepted[s] / (double) st.src_drafted[s] : 0.0);
     for (auto& kv : st.acc_hist) std::fprintf(f, "[spec] accepted %d: %ld steps\n", kv.first, kv.second);
+    if (st.mtp_calls)
+        std::fprintf(f, "[spec] mtp: calls %ld rows %ld; first-draft agreement with the verified argmax %ld/%ld = %.4f\n", st.mtp_calls,
+                     st.mtp_rows, st.mtp_first_ok, st.mtp_first_total,
+                     st.mtp_first_total ? (double) st.mtp_first_ok / (double) st.mtp_first_total : 0.0);
     for (int T = 1; T <= NH_TMAX; ++T)
         if (st.n_by_T[T]) std::fprintf(f, "[spec] decode T=%d: %ld steps, mean %.3f ms\n", T, st.n_by_T[T], 1e3 * st.t_by_T[T] / (double) st.n_by_T[T]);
 }
@@ -1625,6 +1867,7 @@ int main(int argc, char** argv) {
     SpecCfg spec;
     bool spec_check = false;
     int spec_diff = 0;
+    int mtp_topk = 0;
     int K = 32, chunk = 512, ctx = 32768, threads = 16, n_cpu_moe = 68;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -1665,6 +1908,8 @@ int main(int argc, char** argv) {
             if (spec.mode < 0) { std::fprintf(stderr, "--spec off|ngram|mtp|auto\n"); return 2; }
         }
         else if (a == "--spec-k") spec.k = std::stoi(nx());
+        else if (a == "--mtp-topk") mtp_topk = std::stoi(nx());
+        else if (a == "--ng-strong") spec.ng_strong = std::stoi(nx());
         else if (a == "--spec-check") spec_check = true;
         else if (a == "--spec-diff") spec_diff = std::stoi(nx());
         else {
@@ -1693,6 +1938,8 @@ int main(int argc, char** argv) {
     E.C.decay = cache_decay;
     E.C.max_admit = max_admit;
     if (spec.mode) E.k_snap = NH_TMAX;
+    E.mtp_on = spec.mode == 2 || spec.mode == 3;
+    E.mtp_topk = mtp_topk;
     if (spec.k < 1 || spec.k > NH_TMAX - 1) throw std::runtime_error("--spec-k must be 1.." + std::to_string(NH_TMAX - 1));
     E.init(m, n_cpu_moe, 1, ctx, threads, chunk, cache_mode);
     {
