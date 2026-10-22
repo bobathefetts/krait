@@ -37,7 +37,13 @@
 #include "ggml-cpu.h"
 #include "ggml-cuda.h"
 
+#include "nh_cpuexact.cuh"
+
+#include <cuda_runtime.h>
+
 #include <algorithm>
+#include <atomic>
+#include <memory>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -303,6 +309,320 @@ bool dump_cb(ggml_tensor* t, bool ask, void* ud) {
     return true;
 }
 
+// ---- Phase 3: the routed-expert cache (decode, T == 1) ----
+// Every MoE layer gets a VRAM slot pool with an expert -> slot map and LFU-with-decay scores.
+//  * blocks < n_cpu_moe ("lo"): llama.cpp computes their experts on the CPU (ggml-cpu vec_dot) at T < 32.  Here three
+//    CPU-side custom ops replace mul_mat_id/relu/sqr/mul_mat_id: PLAN (1 thread: hit/miss split, q8_K of the latent with
+//    ggml's own quantize_row_q8_K, launch of the CPU-exact CUDA kernels of nh_cpuexact.cuh for the hits on a separate
+//    stream), UP (all threads: miss rows with ggml-cpu's vec_dot, relu^2, ggml's quantize_row_q8_0) and DOWN (all
+//    threads: miss rows; thread 0 then waits for the hit kernels and fills their columns).  Same values as the CPU path
+//    bit for bit; afterwards a few misses are admitted into the pool by async H2D copies from the registered mmap.
+//  * blocks >= n_cpu_moe ("hi"): llama.cpp keeps them resident and runs MMVQ.  Here a PLAN op (1 thread) uploads the
+//    missing experts synchronously into the pool and returns slot ids, and the same mul_mat_id runs on the pool tensor,
+//    so ggml-cuda computes exactly what it computes on the resident tensor.  2 <= T < 32 runs mul_mat_id on the host
+//    tensor forced to the GPU (the scheduler copies the used experts, as op offload does for T >= 32).
+struct SlotPool {
+    int il = -1;
+    bool lo = true;
+    ggml_type tu = GGML_TYPE_COUNT, td = GGML_TYPE_COUNT;
+    size_t up_row = 0, dn_row = 0, up_exp = 0, dn_exp = 0;
+    const uint8_t* host_up = nullptr;   // expert 0 in the mmap
+    const uint8_t* host_dn = nullptr;
+    int cap = 0;
+    ggml_tensor* t_up = nullptr;   // [n_in, n_out, cap] pool tensors (hi: used by mul_mat_id; lo: raw slots)
+    ggml_tensor* t_dn = nullptr;
+    std::vector<int> slot_of, exp_of;
+    std::vector<cudaEvent_t> ready;    // lo: async upload done
+    std::vector<uint8_t> pending;
+    std::vector<double> score;         // LFU with decay: score at step last[e]
+    std::vector<int64_t> last;
+    long hits = 0, misses = 0, uploads = 0, upload_skips = 0;
+    double t_plan = 0, tm_up = 0, tm_dn = 0, t_wait = 0, t_hi_upload = 0;
+    std::atomic<int> ctr_up{0}, ctr_dn{0};
+};
+
+struct CacheCtx {
+    bool on = false, hi_on = false;
+    int n_used = 22, n_in = 1024, n_ff = 2688;
+    double decay = 0.97;               // per decode step
+    int max_admit = 2;                 // per lo layer per step
+    int64_t step = 0;
+    cudaStream_t s_hit = nullptr, s_copy = nullptr, s_hi = nullptr;
+    cudaEvent_t ev_hit = nullptr;
+    // device scratch for the hit kernels (one layer at a time)
+    uint8_t* d_args = nullptr;         // [up ptrs | dn ptrs | xi | col] for <= 22 items
+    uint8_t* d_q8k = nullptr;
+    float* d_upo = nullptr;
+    uint8_t* d_hq = nullptr;
+    float* d_out = nullptr;
+    uint8_t* h_args = nullptr;         // pinned
+    uint8_t* h_q8k = nullptr;
+    float* h_out = nullptr;
+    std::vector<std::unique_ptr<SlotPool>> pools;   // by layer (nullptr for non-MoE)
+    ggml_context* ctx = nullptr;
+    ggml_backend_buffer_t buf = nullptr;
+    size_t pool_bytes = 0;
+    const ggml_type_traits_cpu* q8k_tr = nullptr;
+    const ggml_type_traits_cpu* q80_tr = nullptr;
+};
+
+double eff_score(const SlotPool& p, int e, int64_t step, double decay) {
+    return p.score[(size_t) e] * std::pow(decay, (double) (step - p.last[(size_t) e]));
+}
+void touch(SlotPool& p, int e, int64_t step, double decay) {
+    p.score[(size_t) e] = eff_score(p, e, step, decay) + 1.0;
+    p.last[(size_t) e] = step;
+}
+
+// plan layout (I8 tensor, bytes): int32 n_miss, n_hit, miss_k[22], hit_k[22], hit_slot[22], then q8_K of the latent
+constexpr size_t PLAN_Q8K_OFF = 4 * (2 + 3 * 22);
+constexpr size_t PLAN_BYTES = PLAN_Q8K_OFF + 4 * nhx::Q8K_BYTES;
+
+CacheCtx* g_cache = nullptr;
+
+void launch_hits(CacheCtx& C, SlotPool& p, int n_hit) {
+    const nhx::UpT ut = p.tu == GGML_TYPE_Q4_K ? nhx::UpT::Q4K : p.tu == GGML_TYPE_Q5_K ? nhx::UpT::Q5K : nhx::UpT::Q6K;
+    const nhx::DownT dt = p.td == GGML_TYPE_Q5_0 ? nhx::DownT::Q50 : nhx::DownT::IQ4NL;
+    const uint8_t* const* wup = (const uint8_t* const*) C.d_args;
+    const uint8_t* const* wdn = wup + 22;
+    const int* col = (const int*) (C.d_args + 2 * 22 * sizeof(void*));
+    const int F = C.n_ff, D = C.n_in;
+    dim3 gu((unsigned) (F / 32), (unsigned) n_hit), gq((unsigned) ((F / 32 + 7) / 8), (unsigned) n_hit), gd((unsigned) (D / 32), (unsigned) n_hit);
+    switch (ut) {
+    case nhx::UpT::Q4K: nhx::k_up<nhx::UpT::Q4K><<<gu, 256, 0, C.s_hit>>>(wup, C.d_q8k, F, D / 256, p.up_row, C.d_upo); break;
+    case nhx::UpT::Q5K: nhx::k_up<nhx::UpT::Q5K><<<gu, 256, 0, C.s_hit>>>(wup, C.d_q8k, F, D / 256, p.up_row, C.d_upo); break;
+    default: nhx::k_up<nhx::UpT::Q6K><<<gu, 256, 0, C.s_hit>>>(wup, C.d_q8k, F, D / 256, p.up_row, C.d_upo); break;
+    }
+    nhx::k_relu2_q8_0<<<gq, 256, 0, C.s_hit>>>(C.d_upo, F, C.d_hq);
+    if (dt == nhx::DownT::Q50) nhx::k_down<nhx::DownT::Q50><<<gd, 256, 0, C.s_hit>>>(wdn, C.d_hq, D, F / 32, p.dn_row, col, C.d_out);
+    else nhx::k_down<nhx::DownT::IQ4NL><<<gd, 256, 0, C.s_hit>>>(wdn, C.d_hq, D, F / 32, p.dn_row, col, C.d_out);
+}
+
+// lo PLAN: src0 = latent [n_in, 1, 1] f32, src1 = selected [22, 1] i32 (a view); dst = plan bytes
+void op_plan_lo(ggml_tensor* dst, int ith, int nth, void* ud) {
+    (void) nth;
+    if (ith != 0) return;
+    const double t0 = now_s();
+    SlotPool& p = *static_cast<SlotPool*>(ud);
+    CacheCtx& C = *g_cache;
+    const ggml_tensor* lat = dst->src[0];
+    const ggml_tensor* sel = dst->src[1];
+    uint8_t* plan = (uint8_t*) dst->data;
+    int32_t* pi = (int32_t*) plan;
+    int32_t *miss_k = pi + 2, *hit_k = pi + 2 + 22, *hit_slot = pi + 2 + 44;
+    C.q8k_tr->from_float((const float*) lat->data, plan + PLAN_Q8K_OFF, C.n_in);
+    int n_miss = 0, n_hit = 0;
+    for (int k = 0; k < C.n_used; ++k) {
+        const int e = *(const int32_t*) ((const char*) sel->data + (size_t) k * sel->nb[0]);
+        const int s = p.slot_of[(size_t) e];
+        bool ok = s >= 0;
+        if (ok && p.pending[(size_t) s]) {
+            if (cudaEventQuery(p.ready[(size_t) s]) == cudaSuccess) p.pending[(size_t) s] = 0;
+            else ok = false;
+        }
+        if (ok) {
+            hit_k[n_hit] = k;
+            hit_slot[n_hit++] = s;
+        } else {
+            miss_k[n_miss++] = k;
+        }
+    }
+    pi[0] = n_miss;
+    pi[1] = n_hit;
+    p.hits += n_hit;
+    p.misses += n_miss;
+    p.ctr_up.store(0);
+    p.ctr_dn.store(0);
+    if (n_hit) {
+        const uint8_t** hu = (const uint8_t**) C.h_args;
+        const uint8_t** hd = hu + 22;
+        int* col = (int*) (C.h_args + 2 * 22 * sizeof(void*));
+        for (int h = 0; h < n_hit; ++h) {
+            hu[h] = (const uint8_t*) p.t_up->data + (size_t) hit_slot[h] * p.up_exp;
+            hd[h] = (const uint8_t*) p.t_dn->data + (size_t) hit_slot[h] * p.dn_exp;
+            col[h] = h;
+        }
+        std::memcpy(C.h_q8k, plan + PLAN_Q8K_OFF, (size_t) (C.n_in / 256) * nhx::Q8K_BYTES);
+        cudaMemcpyAsync(C.d_args, C.h_args, 2 * 22 * sizeof(void*) + 22 * sizeof(int), cudaMemcpyHostToDevice, C.s_hit);
+        cudaMemcpyAsync(C.d_q8k, C.h_q8k, (size_t) (C.n_in / 256) * nhx::Q8K_BYTES, cudaMemcpyHostToDevice, C.s_hit);
+        launch_hits(C, p, n_hit);
+        cudaMemcpyAsync(C.h_out, C.d_out, (size_t) n_hit * C.n_in * sizeof(float), cudaMemcpyDeviceToHost, C.s_hit);
+        cudaEventRecord(C.ev_hit, C.s_hit);
+    }
+    p.t_plan += now_s() - t0;
+}
+
+// lo UP: src0 = plan; dst = [34*n_ff/32, 22] I8: q8_0(relu^2(up)) of each miss column (by miss index)
+void op_up_lo(ggml_tensor* dst, int ith, int nth, void* ud) {
+    (void) nth;
+    const double t0 = now_s();
+    SlotPool& p = *static_cast<SlotPool*>(ud);
+    CacheCtx& C = *g_cache;
+    const uint8_t* plan = (const uint8_t*) dst->src[0]->data;
+    const int32_t* pi = (const int32_t*) plan;
+    const ggml_tensor* sel = dst->src[1];
+    const int n_miss = pi[0];
+    const int nblk = C.n_ff / 32;
+    const auto* tr = ggml_get_type_traits_cpu(p.tu);
+    float h[32];
+    for (;;) {
+        const int u = p.ctr_up.fetch_add(1);
+        if (u >= n_miss * nblk) break;
+        const int m = u / nblk, b = u % nblk;
+        const int k = pi[2 + m];
+        const int e = *(const int32_t*) ((const char*) sel->data + (size_t) k * sel->nb[0]);
+        const uint8_t* base = p.host_up + (size_t) e * p.up_exp + (size_t) b * 32 * p.up_row;
+        for (int r = 0; r < 32; ++r) {
+            float v;
+            tr->vec_dot(C.n_in, &v, 0, base + (size_t) r * p.up_row, 0, plan + PLAN_Q8K_OFF, 0, 1);
+            v = v > 0.f ? v : 0.f;
+            h[r] = v * v;
+        }
+        C.q80_tr->from_float(h, (uint8_t*) dst->data + (size_t) m * nblk * nhx::Q80_BYTES + (size_t) b * nhx::Q80_BYTES, 32);
+    }
+    if (ith == 0) p.tm_up += now_s() - t0;
+}
+
+void admit_lo(CacheCtx& C, SlotPool& p, const ggml_tensor* sel, const int32_t* pi) {
+    const int n_miss = pi[0], n_hit = pi[1];
+    std::vector<uint8_t> in_use((size_t) p.cap, 0);
+    for (int h = 0; h < n_hit; ++h) in_use[(size_t) pi[2 + 44 + h]] = 1;
+    for (int k = 0; k < C.n_used; ++k) touch(p, *(const int32_t*) ((const char*) sel->data + (size_t) k * sel->nb[0]), C.step, C.decay);
+    // candidates: misses by score, best first
+    std::vector<std::pair<double, int>> cand;
+    for (int m = 0; m < n_miss; ++m) {
+        const int e = *(const int32_t*) ((const char*) sel->data + (size_t) pi[2 + m] * sel->nb[0]);
+        if (p.slot_of[(size_t) e] >= 0) continue;   // pending upload
+        cand.push_back({eff_score(p, e, C.step, C.decay), e});
+    }
+    std::sort(cand.rbegin(), cand.rend());
+    int admitted = 0;
+    for (auto& ce : cand) {
+        if (admitted >= C.max_admit) {
+            p.upload_skips++;
+            continue;
+        }
+        int victim = -1;
+        double vs = 1e300;
+        for (int s = 0; s < p.cap; ++s) {
+            if (in_use[(size_t) s] || p.pending[(size_t) s]) continue;
+            const int ve = p.exp_of[(size_t) s];
+            const double sc = ve < 0 ? -1.0 : eff_score(p, ve, C.step, C.decay);
+            if (sc < vs) {
+                vs = sc;
+                victim = s;
+            }
+        }
+        if (victim < 0 || vs >= ce.first) break;
+        const int e = ce.second;
+        if (p.exp_of[(size_t) victim] >= 0) p.slot_of[(size_t) p.exp_of[(size_t) victim]] = -1;
+        p.exp_of[(size_t) victim] = e;
+        p.slot_of[(size_t) e] = victim;
+        cudaMemcpyAsync((uint8_t*) p.t_up->data + (size_t) victim * p.up_exp, p.host_up + (size_t) e * p.up_exp, p.up_exp,
+                        cudaMemcpyHostToDevice, C.s_copy);
+        cudaMemcpyAsync((uint8_t*) p.t_dn->data + (size_t) victim * p.dn_exp, p.host_dn + (size_t) e * p.dn_exp, p.dn_exp,
+                        cudaMemcpyHostToDevice, C.s_copy);
+        cudaEventRecord(p.ready[(size_t) victim], C.s_copy);
+        p.pending[(size_t) victim] = 1;
+        in_use[(size_t) victim] = 1;
+        p.uploads++;
+        admitted++;
+    }
+}
+
+// lo DOWN: src0 = UP's q8_0 bytes, src1 = plan, src2 = selected; dst = [n_in, 22, 1] f32 (the ffn_moe_down of llama)
+void op_down_lo(ggml_tensor* dst, int ith, int nth, void* ud) {
+    (void) nth;
+    const double t0 = now_s();
+    SlotPool& p = *static_cast<SlotPool*>(ud);
+    CacheCtx& C = *g_cache;
+    const uint8_t* hq = (const uint8_t*) dst->src[0]->data;
+    const int32_t* pi = (const int32_t*) dst->src[1]->data;
+    const ggml_tensor* sel = dst->src[2];
+    const int n_miss = pi[0], n_hit = pi[1];
+    const int nblk = C.n_ff / 32, rows = 64, nch = C.n_in / rows;
+    const auto* tr = ggml_get_type_traits_cpu(p.td);
+    float* out = (float*) dst->data;
+    for (;;) {
+        const int u = p.ctr_dn.fetch_add(1);
+        if (u >= n_miss * nch) break;
+        const int m = u / nch, c = u % nch;
+        const int k = pi[2 + m];
+        const int e = *(const int32_t*) ((const char*) sel->data + (size_t) k * sel->nb[0]);
+        const uint8_t* base = p.host_dn + (size_t) e * p.dn_exp;
+        const uint8_t* y = hq + (size_t) m * nblk * nhx::Q80_BYTES;
+        for (int r = c * rows; r < (c + 1) * rows; ++r)
+            tr->vec_dot(C.n_ff, &out[(size_t) k * C.n_in + r], 0, base + (size_t) r * p.dn_row, 0, y, 0, 1);
+    }
+    if (ith == 0) {
+        const double t1 = now_s();
+        if (n_hit) {
+            cudaEventSynchronize(C.ev_hit);
+            for (int h = 0; h < n_hit; ++h)
+                std::memcpy(out + (size_t) pi[2 + 22 + h] * C.n_in, C.h_out + (size_t) h * C.n_in, sizeof(float) * C.n_in);
+        }
+        const double t2 = now_s();
+        admit_lo(C, p, sel, pi);
+        p.tm_dn += t1 - t0;
+        p.t_wait += t2 - t1;
+    }
+}
+
+// hi PLAN (T == 1): src0 = selected [22, 1]; dst = slot ids [22, 1] i32 for mul_mat_id on the pool tensors
+void op_plan_hi(ggml_tensor* dst, int ith, int nth, void* ud) {
+    (void) nth;
+    if (ith != 0) return;
+    const double t0 = now_s();
+    SlotPool& p = *static_cast<SlotPool*>(ud);
+    CacheCtx& C = *g_cache;
+    const ggml_tensor* sel = dst->src[0];
+    int32_t* ids = (int32_t*) dst->data;
+    std::vector<int> es((size_t) C.n_used);
+    std::vector<uint8_t> in_use((size_t) p.cap, 0);
+    for (int k = 0; k < C.n_used; ++k) {
+        es[(size_t) k] = *(const int32_t*) ((const char*) sel->data + (size_t) k * sel->nb[0]);
+        touch(p, es[(size_t) k], C.step, C.decay);
+        const int s = p.slot_of[(size_t) es[(size_t) k]];
+        if (s >= 0) in_use[(size_t) s] = 1;
+    }
+    bool up = false;
+    for (int k = 0; k < C.n_used; ++k) {
+        const int e = es[(size_t) k];
+        int s = p.slot_of[(size_t) e];
+        if (s >= 0) {
+            p.hits++;
+        } else {
+            p.misses++;
+            double vs = 1e300;
+            for (int j = 0; j < p.cap; ++j) {
+                if (in_use[(size_t) j]) continue;
+                const int ve = p.exp_of[(size_t) j];
+                const double sc = ve < 0 ? -1.0 : eff_score(p, ve, C.step, C.decay);
+                if (sc < vs) {
+                    vs = sc;
+                    s = j;
+                }
+            }
+            if (s < 0) throw std::runtime_error("nh_engine: hi pool smaller than n_expert_used");
+            if (p.exp_of[(size_t) s] >= 0) p.slot_of[(size_t) p.exp_of[(size_t) s]] = -1;
+            p.exp_of[(size_t) s] = e;
+            p.slot_of[(size_t) e] = s;
+            in_use[(size_t) s] = 1;
+            cudaMemcpyAsync((uint8_t*) p.t_up->data + (size_t) s * p.up_exp, p.host_up + (size_t) e * p.up_exp, p.up_exp,
+                            cudaMemcpyHostToDevice, C.s_hi);
+            cudaMemcpyAsync((uint8_t*) p.t_dn->data + (size_t) s * p.dn_exp, p.host_dn + (size_t) e * p.dn_exp, p.dn_exp,
+                            cudaMemcpyHostToDevice, C.s_hi);
+            p.uploads++;
+            up = true;
+        }
+        ids[k] = s;
+    }
+    const double t1 = now_s();
+    if (up) cudaStreamSynchronize(C.s_hi);
+    p.t_hi_upload += now_s() - t1;
+    p.t_plan += t1 - t0;
+}
+
 // ---- --profile: every node computed on its own (sched eval callback asks for all), wall time per node aggregated by
 // (backend, op, role); used to see where a decode step goes, never for timing runs ----
 struct ProfCtx {
@@ -340,6 +660,12 @@ struct Engine {
     CopyExperts cx;
     DumpCtx dump;
     ProfCtx prof;
+    CacheCtx C;
+    int n_cpu_moe = 68;      // numerics split: experts of blocks < n_cpu_moe follow llama.cpp's CPU path
+    bool pin = false;
+    long cache_mib = -1;     // -1: auto (keep the Gate 3 VRAM limit)
+    int cap_lo = 0, cap_hi = 0;
+    size_t pinned_bytes = 0;
     int n_threads = 16;
     bool force_norm = true;   // llama-context.cpp graph_get_cb: "norm" pinned to the layer's device (full offload)
     int max_nodes = 16384;
@@ -581,13 +907,54 @@ struct Engine {
         }
         ggml_build_forward_expand(gf, weights);
         cur = ggml_reshape_3d(ctx0, inp_latent, n_embd, 1, n_tokens);
-        ggml_tensor* up = ggml_mul_mat_id(ctx0, l.up_exps, cur, selected);
-        ggml_format_name(up, "ffn_moe_up-%d", il);
-        cur = ggml_relu(ctx0, up);
-        cur = ggml_sqr(ctx0, cur);
-        ggml_format_name(cur, "ffn_moe_relu_sqr-%d", il);
-        ggml_tensor* experts = ggml_mul_mat_id(ctx0, l.down_exps, cur, selected);
-        ggml_format_name(experts, "ffn_moe_down-%d", il);
+        ggml_tensor* experts = nullptr;
+        SlotPool* pool = C.on ? C.pools[(size_t) il].get() : nullptr;
+        const bool lo = il < n_cpu_moe;
+        if (pool && n_tokens == 1 && lo) {
+            // the CPU path of llama.cpp (ffn_moe_up / relu / sqr / ffn_moe_down on ggml-cpu), split into cached hits
+            // (CPU-exact CUDA kernels) and misses (ggml-cpu vec_dot), see SlotPool
+            ggml_tensor* a0[2] = {cur, selected};
+            ggml_tensor* plan = ggml_custom_4d(ctx0, GGML_TYPE_I8, (int64_t) PLAN_BYTES, 1, 1, 1, a0, 2, op_plan_lo, 1, pool);
+            ggml_format_name(plan, "nhc_plan-%d", il);
+            ggml_backend_sched_set_tensor_backend(sched, plan, cpu);
+            ggml_tensor* a1[2] = {plan, selected};
+            const int64_t n_ff = l.up_exps->ne[1];
+            ggml_tensor* hq = ggml_custom_4d(ctx0, GGML_TYPE_I8, n_ff / 32 * (int64_t) nhx::Q80_BYTES, n_used, 1, 1, a1, 2,
+                                             op_up_lo, GGML_N_TASKS_MAX, pool);
+            ggml_format_name(hq, "nhc_up-%d", il);
+            ggml_backend_sched_set_tensor_backend(sched, hq, cpu);
+            ggml_tensor* a2[3] = {hq, plan, selected};
+            experts = ggml_custom_4d(ctx0, GGML_TYPE_F32, n_embd, n_used, n_tokens, 1, a2, 3, op_down_lo, GGML_N_TASKS_MAX, pool);
+            ggml_backend_sched_set_tensor_backend(sched, experts, cpu);
+            ggml_format_name(experts, "ffn_moe_down-%d", il);
+        } else if (pool && n_tokens == 1) {
+            // resident-numerics block: the same mul_mat_id on the slot pool, ids remapped by the plan op
+            ggml_tensor* a0[1] = {selected};
+            ggml_tensor* ids = ggml_custom_4d(ctx0, GGML_TYPE_I32, n_used, 1, 1, 1, a0, 1, op_plan_hi, 1, pool);
+            ggml_format_name(ids, "nhc_ids-%d", il);
+            ggml_backend_sched_set_tensor_backend(sched, ids, cpu);
+            ggml_tensor* up = ggml_mul_mat_id(ctx0, pool->t_up, cur, ids);
+            ggml_format_name(up, "ffn_moe_up-%d", il);
+            cur = ggml_relu(ctx0, up);
+            cur = ggml_sqr(ctx0, cur);
+            ggml_format_name(cur, "ffn_moe_relu_sqr-%d", il);
+            experts = ggml_mul_mat_id(ctx0, pool->t_dn, cur, ids);
+            ggml_format_name(experts, "ffn_moe_down-%d", il);
+        } else {
+            ggml_tensor* up = ggml_mul_mat_id(ctx0, l.up_exps, cur, selected);
+            ggml_format_name(up, "ffn_moe_up-%d", il);
+            cur = ggml_relu(ctx0, up);
+            cur = ggml_sqr(ctx0, cur);
+            ggml_format_name(cur, "ffn_moe_relu_sqr-%d", il);
+            experts = ggml_mul_mat_id(ctx0, l.down_exps, cur, selected);
+            ggml_format_name(experts, "ffn_moe_down-%d", il);
+            if (C.on && C.hi_on && !lo && n_tokens < 32) {
+                // llama.cpp keeps these experts resident; with them in host memory the GPU must still compute them
+                // (the scheduler uploads the used experts, as op offload does for >= 32 tokens)
+                ggml_backend_sched_set_tensor_backend(sched, up, gpu);
+                ggml_backend_sched_set_tensor_backend(sched, experts, gpu);
+            }
+        }
         experts = ggml_mul(ctx0, experts, weights);
         ggml_format_name(experts, "ffn_moe_weighted-%d", il);
         ggml_build_forward_expand(gf, experts);
@@ -676,13 +1043,165 @@ struct Engine {
         gi.logits = cur;
     }
 
-    void init(const nh::Model& m, int n_cpu_moe, int n_slots, int n_ctx, int threads, int ubatch) {
+    // cudaHostRegister (read-only) of the host-mapped routed experts, merged into page-aligned ranges, so expert
+    // uploads (op-offload copies of prefill, cache admissions) are DMA from page-locked memory (~50+ GB/s measured vs
+    // ~20 GB/s pageable: reports/phase3/pin_test).  Stops at the first failure and keeps what is registered.
+    void pin_experts() {
+        std::vector<std::pair<uintptr_t, uintptr_t>> r;
+        const uintptr_t pg = 4096;
+        for (const LayerW& l : W.L)
+            for (ggml_tensor* t : {l.up_exps, l.down_exps})
+                if (t && t->buffer && ggml_backend_buffer_is_host(t->buffer)) {
+                    const uintptr_t a = (uintptr_t) t->data & ~(pg - 1);
+                    const uintptr_t b = ((uintptr_t) t->data + ggml_nbytes(t) + pg - 1) & ~(pg - 1);
+                    r.push_back({a, b});
+                }
+        std::sort(r.begin(), r.end());
+        std::vector<std::pair<uintptr_t, uintptr_t>> mr;
+        for (auto& x : r) {
+            if (!mr.empty() && x.first <= mr.back().second) mr.back().second = std::max(mr.back().second, x.second);
+            else mr.push_back(x);
+        }
+        for (auto& x : mr) {
+            const cudaError_t e = cudaHostRegister((void*) x.first, x.second - x.first, cudaHostRegisterReadOnly);
+            if (e != cudaSuccess) {
+                cudaGetLastError();
+                std::fprintf(stderr, "[nh_engine] cudaHostRegister failed (%s) after %.1f MiB; the rest stays pageable\n",
+                             cudaGetErrorString(e), pinned_bytes / 1048576.0);
+                break;
+            }
+            pinned_bytes += x.second - x.first;
+        }
+        std::fprintf(stderr, "[nh_engine] page-locked %.1f MiB of host experts in %zu ranges\n", pinned_bytes / 1048576.0, mr.size());
+    }
+
+    void init_cache(size_t vram_limit_used) {
+        g_cache = &C;
+        C.on = true;
+        C.n_used = W.g.n_expert_used;
+        int n_expert = 0;
+        for (const LayerW& l : W.L)
+            if (l.kind == nh::Kind::Moe) {
+                C.n_in = (int) l.up_exps->ne[0];
+                C.n_ff = (int) l.up_exps->ne[1];
+                n_expert = (int) l.up_exps->ne[2];
+                break;
+            }
+        C.q8k_tr = ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
+        C.q80_tr = ggml_get_type_traits_cpu(GGML_TYPE_Q8_0);
+        auto ck = [](cudaError_t e, const char* w) {
+            if (e != cudaSuccess) throw std::runtime_error(std::string("nh_engine cache: ") + w + ": " + cudaGetErrorString(e));
+        };
+        ck(cudaStreamCreateWithFlags(&C.s_hit, cudaStreamNonBlocking), "stream");
+        ck(cudaStreamCreateWithFlags(&C.s_copy, cudaStreamNonBlocking), "stream");
+        ck(cudaStreamCreateWithFlags(&C.s_hi, cudaStreamNonBlocking), "stream");
+        ck(cudaEventCreateWithFlags(&C.ev_hit, cudaEventDisableTiming), "event");
+        const size_t NU = 22, F = (size_t) C.n_ff, D = (size_t) C.n_in;
+        ck(cudaMalloc(&C.d_args, 1024), "scratch");
+        ck(cudaMalloc(&C.d_q8k, 4 * nhx::Q8K_BYTES), "scratch");
+        ck(cudaMalloc(&C.d_upo, NU * F * 4), "scratch");
+        ck(cudaMalloc(&C.d_hq, NU * (F / 32) * nhx::Q80_BYTES), "scratch");
+        ck(cudaMalloc(&C.d_out, NU * D * 4), "scratch");
+        ck(cudaHostAlloc(&C.h_args, 1024, cudaHostAllocDefault), "pinned");
+        ck(cudaHostAlloc(&C.h_q8k, 4 * nhx::Q8K_BYTES, cudaHostAllocDefault), "pinned");
+        ck(cudaHostAlloc(&C.h_out, NU * D * 4, cudaHostAllocDefault), "pinned");
+        // VRAM budget: what is free now minus what keeps the process under vram_limit_used, minus a margin for
+        // CUDA graphs / cuBLAS workspaces that appear at the first decode
+        size_t fr = 0, tot = 0;
+        ggml_backend_dev_memory(ggml_backend_get_device(gpu), &fr, &tot);
+        const size_t used = tot - fr, margin = 384ull << 20;
+        size_t budget = used + margin < vram_limit_used ? vram_limit_used - used - margin : 0;
+        if (cache_mib >= 0) budget = std::min(budget, (size_t) cache_mib << 20);
+        C.pools.resize((size_t) W.g.n_layer);
+        size_t per_set = 0;
+        int n_lo = 0, n_hi = 0;
+        for (int il = 0; il < W.g.n_layer; ++il) {
+            const LayerW& l = W.L[(size_t) il];
+            if (l.kind != nh::Kind::Moe) continue;
+            const bool lo = il < n_cpu_moe;
+            if (!lo && !C.hi_on) continue;
+            if (!ggml_backend_buffer_is_host(l.up_exps->buffer)) throw std::runtime_error("nh_engine cache: experts not host-mapped");
+            auto p = std::make_unique<SlotPool>();
+            p->il = il;
+            p->lo = lo;
+            p->tu = l.up_exps->type;
+            p->td = l.down_exps->type;
+            p->up_row = ggml_row_size(p->tu, C.n_in);
+            p->dn_row = ggml_row_size(p->td, C.n_ff);
+            p->up_exp = l.up_exps->nb[2];
+            p->dn_exp = l.down_exps->nb[2];
+            if (p->up_exp != p->up_row * F || p->dn_exp != p->dn_row * D) throw std::runtime_error("nh_engine cache: expert stride");
+            p->host_up = (const uint8_t*) l.up_exps->data;
+            p->host_dn = (const uint8_t*) l.down_exps->data;
+            per_set += p->up_exp + p->dn_exp;
+            (lo ? n_lo : n_hi)++;
+            C.pools[(size_t) il] = std::move(p);
+        }
+        const int cap_u = per_set ? (int) std::min<size_t>(budget / per_set, (size_t) n_expert) : 0;
+        ggml_init_params ip{ggml_tensor_overhead() * 2 * (size_t) W.g.n_layer + 1024, nullptr, true};
+        C.ctx = ggml_init(ip);
+        for (auto& pp : C.pools) {
+            if (!pp) continue;
+            int cap = pp->lo ? (cap_lo > 0 ? cap_lo : cap_u) : (cap_hi > 0 ? cap_hi : cap_u);
+            cap = std::min(cap, n_expert);
+            if (!pp->lo && cap < C.n_used) throw std::runtime_error("nh_engine cache: VRAM budget too small for the hi pools");
+            pp->cap = cap;
+            pp->t_up = ggml_new_tensor_3d(C.ctx, pp->tu, C.n_in, C.n_ff, std::max(cap, 1));
+            pp->t_dn = ggml_new_tensor_3d(C.ctx, pp->td, C.n_ff, C.n_in, std::max(cap, 1));
+            ggml_format_name(pp->t_up, "pool_up-%d", pp->il);
+            ggml_format_name(pp->t_dn, "pool_down-%d", pp->il);
+            pp->slot_of.assign((size_t) n_expert, -1);
+            pp->exp_of.assign((size_t) std::max(cap, 1), -1);
+            pp->pending.assign((size_t) std::max(cap, 1), 0);
+            pp->ready.resize((size_t) std::max(cap, 1));
+            for (auto& ev : pp->ready) ck(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming), "event");
+            pp->score.assign((size_t) n_expert, 0.0);
+            pp->last.assign((size_t) n_expert, 0);
+        }
+        C.buf = ggml_backend_alloc_ctx_tensors_from_buft(C.ctx, ggml_backend_get_default_buffer_type(gpu));
+        if (!C.buf) throw std::runtime_error("nh_engine cache: pool allocation failed");
+        ggml_backend_buffer_set_usage(C.buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        C.pool_bytes = ggml_backend_buffer_get_size(C.buf);
+        ggml_backend_dev_memory(ggml_backend_get_device(gpu), &fr, &tot);
+        std::fprintf(stderr, "[nh_engine] expert cache: %d lo + %d hi pools, slots/layer lo %d hi %d, %.1f MiB (budget %.1f MiB); "
+                             "GPU free now %.1f MiB\n", n_lo, n_hi, cap_lo > 0 ? cap_lo : cap_u, cap_hi > 0 ? cap_hi : cap_u,
+                     C.pool_bytes / 1048576.0, budget / 1048576.0, fr / 1048576.0);
+    }
+
+    void cache_stats(FILE* f) {
+        if (!C.on) return;
+        long h = 0, mi = 0, up = 0;
+        double tp = 0, tu = 0, td = 0, tw = 0, th = 0;
+        for (auto& pp : C.pools) {
+            if (!pp) continue;
+            std::fprintf(f, "[cache] blk %2d %s cap %3d hits %8ld misses %8ld hit %.4f uploads %6ld skips %6ld plan %.3f up %.3f "
+                            "down %.3f wait %.3f hi_upload %.3f s\n", pp->il, pp->lo ? "lo" : "hi", pp->cap, pp->hits, pp->misses,
+                         pp->hits + pp->misses ? (double) pp->hits / (double) (pp->hits + pp->misses) : 0.0, pp->uploads,
+                         pp->upload_skips, pp->t_plan, pp->tm_up, pp->tm_dn, pp->t_wait, pp->t_hi_upload);
+            h += pp->hits;
+            mi += pp->misses;
+            up += pp->uploads;
+            tp += pp->t_plan;
+            tu += pp->tm_up;
+            td += pp->tm_dn;
+            tw += pp->t_wait;
+            th += pp->t_hi_upload;
+        }
+        std::fprintf(f, "[cache] total hits %ld misses %ld hit %.4f uploads %ld steps %lld; time plan %.2f up %.2f down %.2f wait %.2f "
+                        "hi_upload %.2f s\n", h, mi, h + mi ? (double) h / (double) (h + mi) : 0.0, up, (long long) C.step, tp, tu, td, tw, th);
+    }
+
+    void init(const nh::Model& m, int n_cpu_moe_, int n_slots, int n_ctx, int threads, int ubatch, int cache_mode = 0) {
+        n_cpu_moe = n_cpu_moe_;
         gpu = ggml_backend_cuda_init(0);
         cpu = ggml_backend_cpu_init();
         if (!gpu || !cpu) throw std::runtime_error("nh_engine: backend init failed");
         n_threads = threads;
         ggml_backend_cpu_set_n_threads(cpu, n_threads);
-        load_weights(m, n_cpu_moe, ggml_backend_get_default_buffer_type(gpu), W);
+        C.hi_on = cache_mode == 2;
+        // cache mode 2 keeps every routed expert in host memory (the VRAM of the resident blocks becomes slot pools)
+        load_weights(m, cache_mode == 2 ? m.g.n_layer : n_cpu_moe, ggml_backend_get_default_buffer_type(gpu), W);
+        if (pin) pin_experts();
         init_memory(n_slots, n_ctx);
         ggml_backend_t backs[2] = {gpu, cpu};
         // the CPU backend computes into pinned host memory (llama-context.cpp:505-518: host buffer of the first device)
@@ -697,6 +1216,7 @@ struct Engine {
         if (!ggml_backend_sched_reserve(sched, gf)) throw std::runtime_error("nh_engine: sched reserve failed");
         ggml_free(ctx0);
         ctx0 = nullptr;
+        if (cache_mode) init_cache(29346ull << 20);
     }
 
     void clear_slot(int slot) { M.n_past[(size_t) slot] = 0; }
@@ -705,6 +1225,7 @@ struct Engine {
     void decode(const int32_t* tok, int64_t T, int slot, bool all_out) {
         const int64_t pos0 = M.n_past[(size_t) slot];
         if (pos0 + T > M.n_ctx) throw std::runtime_error("nh_engine: context full");
+        if (C.on && T == 1) C.step++;
         const int64_t n_kv = std::min<int64_t>(M.n_ctx, std::max<int64_t>(256, ((pos0 + T + 255) / 256) * 256));
         const int64_t n_out = all_out ? T : 1;
         const int64_t rs_zero = pos0 == 0 ? slot : -1;
@@ -768,6 +1289,10 @@ std::set<std::string> split_ids(const std::string& s) {
 int main(int argc, char** argv) {
     std::string model, list, tokdir, outdir, force, only, dump_sums, dump_prompt, bench, bench_out;
     int profile = 0;
+    bool pin = false;
+    int cache_mode = 0, cap_lo = 0, cap_hi = 0, max_admit = 2;
+    long cache_mib = -1;
+    double cache_decay = 0.97;
     int K = 32, chunk = 512, ctx = 32768, threads = 16, n_cpu_moe = 68;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -791,6 +1316,17 @@ int main(int argc, char** argv) {
         else if (a == "--bench") bench = nx();
         else if (a == "--bench-out") bench_out = nx();
         else if (a == "--profile") profile = std::stoi(nx());
+        else if (a == "--pin") pin = true;
+        else if (a == "--cache") {
+            const std::string v = nx();
+            cache_mode = v == "lo" ? 1 : v == "all" ? 2 : v == "off" ? 0 : -1;
+            if (cache_mode < 0) { std::fprintf(stderr, "--cache lo|all|off\n"); return 2; }
+        }
+        else if (a == "--cache-mib") cache_mib = std::stol(nx());
+        else if (a == "--cap-lo") cap_lo = std::stoi(nx());
+        else if (a == "--cap-hi") cap_hi = std::stoi(nx());
+        else if (a == "--cache-decay") cache_decay = std::stod(nx());
+        else if (a == "--max-admit") max_admit = std::stoi(nx());
         else {
             std::fprintf(stderr, "unknown argument %s\n", a.c_str());
             return 2;
@@ -800,7 +1336,9 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: strata-nh-engine --model SHARD --list LIST --tokdir DIR --out RAWDIR [--k 32] "
                              "[--chunk 512] [--ctx 32768] [--threads 16] [--n-cpu-moe 68] [--force RAWDIR] [--only ids] "
                              "[--dump-sums FILE --dump-prompt ID]\n       strata-nh-engine --model SHARD --bench FILE --bench-out JSONL "
-                             "[--profile NTOK] [--chunk 512] [--ctx 32768] [--threads 16] [--n-cpu-moe 68]\n");
+                             "[--profile NTOK] [--chunk 512] [--ctx 32768] [--threads 16] [--n-cpu-moe 68]\n"
+                             "       either: [--pin] [--cache lo|all|off] [--cache-mib N] [--cap-lo N] [--cap-hi N] "
+                             "[--cache-decay 0.97] [--max-admit 2]\n");
         return 2;
     }
     const std::set<std::string> only_ids = split_ids(only);
@@ -808,7 +1346,13 @@ int main(int argc, char** argv) {
     const strata::GgufModel gm = strata::GgufModel::open(model);
     const nh::Model m = nh::load_model(gm);
     Engine E;
-    E.init(m, n_cpu_moe, 1, ctx, threads, chunk);
+    E.pin = pin;
+    E.cache_mib = cache_mib;
+    E.cap_lo = cap_lo;
+    E.cap_hi = cap_hi;
+    E.C.decay = cache_decay;
+    E.C.max_admit = max_admit;
+    E.init(m, n_cpu_moe, 1, ctx, threads, chunk, cache_mode);
     {
         size_t fr = 0, tot = 0;
         ggml_backend_dev_memory(ggml_backend_get_device(E.gpu), &fr, &tot);
@@ -873,6 +1417,7 @@ int main(int argc, char** argv) {
             }
         }
         std::fclose(bo);
+        E.cache_stats(stderr);
         return 0;
     }
     FILE* sumf = std::fopen((outdir + "/capture_log.txt").c_str(), "w");
@@ -956,5 +1501,6 @@ int main(int argc, char** argv) {
                      out.size(), is_eog ? 1 : 0, t1 - t0, t2 - t1);
     }
     std::fclose(sumf);
+    E.cache_stats(stderr);
     return 0;
 }
