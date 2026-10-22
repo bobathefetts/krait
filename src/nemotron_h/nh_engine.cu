@@ -1660,7 +1660,7 @@ struct SpecStats {
     double t_draft = 0, t_verify = 0, t_plain = 0, t_commit = 0;
     double t_by_T[NH_TMAX + 1] = {};
     long n_by_T[NH_TMAX + 1] = {};
-    long mtp_calls = 0, mtp_rows = 0, mtp_first_total = 0, mtp_first_ok = 0;
+    long mtp_calls = 0, mtp_rows = 0, mtp_first_total = 0, mtp_first_ok = 0, gated_steps = 0;
 };
 
 // most recent earlier occurrence of the last n context tokens (n = nmax .. nmin), and up to k tokens that followed it
@@ -1688,6 +1688,8 @@ struct SpecCfg {
     int k = 3;           // max drafts per step (verify batch = k + 1 <= NH_TMAX)
     int ng_min = 2, ng_max = 4;
     int ng_strong = 3;   // auto: an n-gram match at least this long wins over the MTP draft
+    double min_acc = 0.0;   // adaptive: skip drafting while the EMA of the per-draft acceptance is below this
+    int probe_every = 8;    // ... but still draft every probe_every-th step to track it
 };
 
 // Generation after the prompt: `last` = logits of the last prompt token (and, with the MTP head, E.hrows = its
@@ -1704,6 +1706,8 @@ void spec_generate(Engine& E, const SpecCfg& cfg, SpecStats& st, std::vector<int
     std::vector<float> pend_h, h_last;
     std::vector<int32_t> pend_t;
     int64_t mtp_pos = 0;
+    double ema = 1.0;   // per-draft-token acceptance, EMA over verify steps
+    int since_probe = 0;
     if (use_mtp) {
         if (E.hrows.size() < (size_t) ne) throw std::runtime_error("spec: no h rows from the prompt");
         h_last.assign(E.hrows.end() - ne, E.hrows.end());
@@ -1716,7 +1720,13 @@ void spec_generate(Engine& E, const SpecCfg& cfg, SpecStats& st, std::vector<int
         if (t_tok) t_tok->push_back(now_s());
         if ((stop_eog && eog.count(x)) || (int) out.size() >= maxgen) break;
         const double td0 = now_s();
-        const int kmax = std::min(cfg.k, std::min(NH_TMAX - 1, maxgen - (int) out.size()));
+        int kmax = std::min(cfg.k, std::min(NH_TMAX - 1, maxgen - (int) out.size()));
+        if (cfg.min_acc > 0 && ema < cfg.min_acc && ++since_probe < cfg.probe_every) {
+            kmax = 0;
+            st.gated_steps++;
+        } else {
+            since_probe = 0;
+        }
         int nm = 0;
         std::vector<int32_t> dn, dm, d;
         if (kmax > 0 && (cfg.mode == 1 || cfg.mode == 3)) dn = ngram_propose(ctx_toks, kmax, cfg.ng_min, cfg.ng_max, &nm);
@@ -1810,6 +1820,7 @@ void spec_generate(Engine& E, const SpecCfg& cfg, SpecStats& st, std::vector<int
         }
         st.accepted += a - 1;
         st.src_accepted[src] += a - 1;
+        ema = 0.8 * ema + 0.2 * (double) (a - 1) / (double) (T - 1);
         st.acc_hist[a - 1]++;
         if (stop) break;
         std::memcpy(last.data(), E.logits.data() + (size_t) (a - 1) * nv, sizeof(float) * (size_t) nv);
@@ -1838,6 +1849,7 @@ void print_spec_stats(const SpecStats& st, FILE* f) {
             std::fprintf(f, "[spec] source %s: steps %ld drafted %ld accepted %ld rate %.4f\n", nm[s], st.src_steps[s], st.src_drafted[s],
                          st.src_accepted[s], st.src_drafted[s] ? (double) st.src_accepted[s] / (double) st.src_drafted[s] : 0.0);
     for (auto& kv : st.acc_hist) std::fprintf(f, "[spec] accepted %d: %ld steps\n", kv.first, kv.second);
+    if (st.gated_steps) std::fprintf(f, "[spec] steps without drafting (acceptance EMA below --spec-min-acc): %ld\n", st.gated_steps);
     if (st.mtp_calls)
         std::fprintf(f, "[spec] mtp: calls %ld rows %ld; first-draft agreement with the verified argmax %ld/%ld = %.4f\n", st.mtp_calls,
                      st.mtp_rows, st.mtp_first_ok, st.mtp_first_total,
@@ -1910,6 +1922,7 @@ int main(int argc, char** argv) {
         else if (a == "--spec-k") spec.k = std::stoi(nx());
         else if (a == "--mtp-topk") mtp_topk = std::stoi(nx());
         else if (a == "--ng-strong") spec.ng_strong = std::stoi(nx());
+        else if (a == "--spec-min-acc") spec.min_acc = std::stod(nx());
         else if (a == "--spec-check") spec_check = true;
         else if (a == "--spec-diff") spec_diff = std::stoi(nx());
         else {
