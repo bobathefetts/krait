@@ -27,6 +27,21 @@ Every number here was measured; nothing is estimated. They come from one machine
 | llama.cpp b11806 (llama-server, same prompts) | 14.300132 | - |
 | ratio | 1.6095x | |
 
+## Decode without speculation (earlier build)
+
+Krait's Phase 3 build (VRAM expert cache + pinned host experts, no MTP speculation; flags `--n-cpu-moe 68 --cache all
+--pin --chunk 512`, 16 threads, the same VRAM cap), the same 6 prompts x 3 runs, 256 tokens each, greedy, measured in
+its own session together with a fresh llama.cpp b11806 run:
+
+| | median decode tok/s | per-prompt medians (p0, p4, p7, p13, p16, p21) |
+|---|---|---|
+| Krait, no speculation | 20.679 (min 20.18, max 21.46) | 20.296, 20.645, 20.704, 21.146, 20.603, 20.671 |
+| llama.cpp b11806, same session | 14.316 | 14.242, 14.328, 14.35, 14.215, 14.308, 14.344 |
+| ratio | 1.444x | |
+
+The 18-run median above is from that build. A single run of the 6 prompts after a later expert-cache fix, still
+without speculation, gave 20.296 / 20.890 / 21.093 / 21.797 / 20.898 / 21.151 tok/s.
+
 ## Prompt reading (synthetic prompts, median of 3)
 
 | prompt tokens | Krait prompt tok/s | Krait time to first token | llama.cpp prompt tok/s | llama.cpp time to first token |

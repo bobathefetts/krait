@@ -1,5 +1,8 @@
 blank_issues_enabled: true
 contact_links:
-  - name: Troubleshooting and known issues
+  - name: Krait documentation (build, flags, limits, Docker)
+    url: https://github.com/bobathefetts/krait/blob/main/docs/KRAIT.md
+    about: Requirements, engine flags, server limits and known limits of the Nemotron 3.5 Super port.
+  - name: Strata (upstream, Qwen models) troubleshooting
     url: https://github.com/Niko1221/Strata/blob/main/docs/TROUBLESHOOTING.md
-    about: Symptom-to-fix table for crashes, out of memory, hangs, and port problems.
+    about: For Strata itself and its Qwen engine, see the upstream project.

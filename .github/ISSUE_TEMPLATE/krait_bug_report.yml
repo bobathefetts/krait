@@ -1,0 +1,86 @@
+name: Krait bug report
+description: Something in Krait (the Nemotron 3.5 Super engine, server or Docker stack) doesn't work as documented
+title: "[Engine] "
+labels: ["bug"]
+body:
+  - type: markdown
+    value: |
+      Thanks for the report. Search the [open and closed issues](https://github.com/bobathefetts/krait/issues?q=is%3Aissue) first.
+
+      Write only what you saw. Keep the area prefix at the start of the title ([Engine], [Docs] or [Other]) and
+      remove API keys, passwords and private text from anything you paste.
+  - type: dropdown
+    id: krait-area
+    attributes:
+      label: Part of Krait
+      options:
+        - "krait-engine (speed, output, crashes, memory)"
+        - "server / API (OpenAI or Anthropic endpoints, pictures)"
+        - "build (krait/build.sh, CUDA, cmake)"
+        - "Docker stack (Open WebUI, RAG)"
+        - "docs"
+        - "other"
+    validations:
+      required: true
+  - type: textarea
+    id: wrong
+    attributes:
+      label: What went wrong
+      description: What you did, what you got, and what you expected instead. Paste the exact error text if there is one.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps or command that reproduce it
+      description: The shortest way to make it happen again, with the request (if any) and the engine flags. If you cannot reproduce it, say so.
+    validations:
+      required: false
+  - type: input
+    id: commit
+    attributes:
+      label: Krait commit
+      description: The output of `git rev-parse --short HEAD` in your checkout.
+      placeholder: "05d85d2d"
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU and VRAM
+      description: The card, its VRAM, the driver version and any `--vram-limit-mib` you set.
+      placeholder: "RTX 5090 32 GB, driver 617.42, --vram-limit-mib 29346"
+    validations:
+      required: true
+  - type: input
+    id: cpu-ram
+    attributes:
+      label: CPU and RAM
+      description: The CPU, the RAM in the PC, and the RAM Linux sees (`free -m`, MemTotal).
+      placeholder: "Ryzen 9 7950X3D, 128 GB RAM (116,713 MiB visible in WSL2)"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS, CUDA and how you run it
+      description: Linux distribution or WSL2, CUDA toolkit version, and whether you run krait/krait or the Docker stack.
+      placeholder: "WSL2 Ubuntu 24.04, CUDA 12.9, krait/krait"
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model files and settings
+      description: The GGUF quant, the mmproj, the context, and engine flags you changed from krait/config.json.
+      placeholder: "UD-Q4_K_XL + mmproj-BF16, --max-context 32768, defaults otherwise"
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: The engine's startup lines (expert cache size, pinned MiB) and the error. `logs/` under KRAIT_ROOT holds the run config.
+      render: text
+    validations:
+      required: false

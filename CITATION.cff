@@ -1,0 +1,30 @@
+cff-version: 1.2.0
+message: "If you use Krait in your work, please cite it as below, and cite Strata, which it is based on."
+title: "Krait: fast local inference for NVIDIA Nemotron 3.5 Super (hybrid Mamba-2/MoE)"
+type: software
+authors:
+  - alias: bobathefetts
+repository-code: "https://github.com/bobathefetts/krait"
+url: "https://github.com/bobathefetts/krait"
+license: MIT
+keywords:
+  - nemotron
+  - llm-inference
+  - cuda
+  - mamba
+  - moe
+  - strata
+references:
+  - type: software
+    title: Strata
+    authors:
+      - alias: Niko1221
+    repository-code: "https://github.com/Niko1221/Strata"
+    license: MIT
+    version: "0.2.2"
+  - type: software
+    title: llama.cpp
+    authors:
+      - name: "The ggml authors"
+    repository-code: "https://github.com/ggml-org/llama.cpp"
+    license: MIT
