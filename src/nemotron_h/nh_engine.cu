@@ -40,6 +40,9 @@
 #include "nh_cpuexact.cuh"
 
 #include <cuda_runtime.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
@@ -1062,7 +1065,44 @@ struct Engine {
             if (!mr.empty() && x.first <= mr.back().second) mr.back().second = std::max(mr.back().second, x.second);
             else mr.push_back(x);
         }
+        // the GGUF loader maps the shards MAP_PRIVATE; cudaHostRegister on a private file mapping does not return
+        // under WSL2 (reports/phase3/pin_priv: 1 GiB > 100 s, vs 0.035 s for MAP_SHARED).  The expert ranges are
+        // read-only and never written, so they are re-mapped MAP_SHARED|MAP_FIXED from the same file offsets (same
+        // bytes, same addresses: the ggml tensors keep their data pointers).
+        struct MapEnt { uintptr_t a, b; uint64_t off; std::string path; };
+        std::vector<MapEnt> maps;
+        {
+            std::ifstream mf("/proc/self/maps");
+            std::string line;
+            while (std::getline(mf, line)) {
+                std::istringstream ls(line);
+                std::string range, perms, offs, dev, inode, path;
+                ls >> range >> perms >> offs >> dev >> inode;
+                std::getline(ls, path);
+                path.erase(0, path.find_first_not_of(' '));
+                if (path.empty() || path[0] != '/') continue;
+                const size_t dash = range.find('-');
+                maps.push_back({std::stoull(range.substr(0, dash), nullptr, 16), std::stoull(range.substr(dash + 1), nullptr, 16),
+                                std::stoull(offs, nullptr, 16), path});
+            }
+        }
         for (auto& x : mr) {
+            const MapEnt* me = nullptr;
+            for (const MapEnt& m : maps)
+                if (x.first >= m.a && x.second <= m.b) me = &m;
+            if (!me) {
+                std::fprintf(stderr, "[nh_engine] pin: range not inside one file mapping; stopping\n");
+                break;
+            }
+            const int fd = open(me->path.c_str(), O_RDONLY);
+            void* q = fd < 0 ? MAP_FAILED
+                             : mmap((void*) x.first, x.second - x.first, PROT_READ, MAP_SHARED | MAP_FIXED, fd,
+                                    (off_t) (me->off + (x.first - me->a)));
+            if (fd >= 0) close(fd);
+            if (q != (void*) x.first) {
+                // MAP_FIXED failure leaves the old mapping in place only if mmap failed before unmapping; abort loudly
+                throw std::runtime_error("nh_engine: pin remap failed for " + me->path);
+            }
             const cudaError_t e = cudaHostRegister((void*) x.first, x.second - x.first, cudaHostRegisterReadOnly);
             if (e != cudaSuccess) {
                 cudaGetLastError();
