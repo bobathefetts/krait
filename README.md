@@ -24,9 +24,11 @@ on a single 32 GB NVIDIA card such as an RTX 5090, with the routed experts of mo
 `krait-engine`, runs on llama.cpp's ggml kernels (b11806) with its own graph, expert cache, scheduler and MTP
 speculation. It serves text and pictures over the OpenAI and Anthropic APIs, with up to 4 requests at once.
 
-The model goes by several names: NVIDIA publishes it as
-[`nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16),
-and it is often called Nemotron-3.5-Super, Nemotron 3.5 Super 120B or NVIDIA Nemotron Super. Krait runs Unsloth's GGUF
+The model goes by several names. Its official ID is `NVIDIA-Nemotron-3.5-Super-VL-120B-A12B` (NVIDIA publishes it as
+[`nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16));
+it is also called Nemotron-3.5-Super, Nemotron Super 3.5 VL, Nemotron 3.5 Super 120B or NVIDIA Nemotron Super, and
+Ollama lists it as `nemotron-3.5-super`. Its language model uses NVIDIA's Nemotron-H hybrid architecture
+(`NemotronHForCausalLM` in Transformers, `nemotron_h_moe` in GGUF). Krait runs Unsloth's GGUF
 conversion of that model,
 [`unsloth/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-GGUF`](https://huggingface.co/unsloth/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-GGUF).
 
@@ -207,6 +209,14 @@ The rest of Strata (its Qwen engine, the app and tools) is still in this reposit
 
 **Is this Strata Nemotron, or a fork of Strata?** Both: it is a fork of Strata v0.2.2 that adds a Nemotron 3.5 Super
 engine. If you searched for "Strata Nemotron", this is it. Strata itself runs Qwen models; Krait runs Nemotron.
+
+**How is Krait different from other Nemotron ports of Strata?** Krait runs the standard Unsloth GGUF (UD-Q4_K_XL) with
+llama.cpp's numerics: with greedy decoding its output is token-identical to a llama.cpp b11806 reference capture on all
+32 prompts of the golden set. It does not depend on Blackwell FP4 / NVFP4 kernels, and its speed figures are measured
+against llama.cpp on the same machine ([docs/BENCHMARKS.md](docs/BENCHMARKS.md)). If you own a Blackwell card and want
+FP4, there are NVFP4-based forks too, for example the
+[`strata-nemotron` branch of Cudila/Strata](https://github.com/Cudila/Strata/tree/strata-nemotron), which targets
+NVFP4 weights on FP4 tensor cores.
 
 **Does it run other Nemotron models (Nemotron 3 Super, Nemotron 3.5 Lightning, Nano)?** Krait was built and tested
 only for Nemotron 3.5 Super VL 120B-A12B (UD-Q4_K_XL). Other Nemotron models and other quantizations are untested;
