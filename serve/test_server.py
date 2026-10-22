@@ -5413,6 +5413,8 @@ class ImageSources(unittest.TestCase):
             with mock.patch.object(Path, "read_bytes", side_effect=PermissionError("denied")),                     self.assertRaisesRegex(ValueError, "could not be read from"):
                 Vision.load(str(f))
 
+    # the test server is on 127.0.0.1, which the public-address guard refuses (serve/test_krait_launch.py tests that)
+    @mock.patch("serve.server.public_url_host", lambda url: None)
     def test_a_url_is_read_up_to_the_cap(self):
         import http.server
         import serve.server as server
