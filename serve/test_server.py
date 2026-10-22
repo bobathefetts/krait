@@ -5373,6 +5373,16 @@ class ImageSources(unittest.TestCase):
     """What an image source may name: never a network path (Windows signs in to the host at the first look), a URL up
     to IMAGE_URL_MAX and downloaded outside the request FIFO, a file on this computer not for a page of another site."""
 
+    def setUp(self):   # Krait turns files and URLs off by default; these tests are about how they are read when on
+        import serve.server as server
+        self._sources = dict(server.IMAGE_SOURCES)
+        server.IMAGE_SOURCES.update(files=True, urls=True)
+
+    def tearDown(self):
+        import serve.server as server
+        server.IMAGE_SOURCES.clear()
+        server.IMAGE_SOURCES.update(self._sources)
+
     NETWORK = [r"\\host\share\x.png", "//host/share/x.png", r"\\?\UNC\host\share\x.png", r"\\.\UNC\host\share\x.png",
                r"\??\UNC\host\share\x.png", r"/\host\share\x.png", "file://host/share/x.png",
                "file:////host/share/x.png", r"file://\\host\share\x.png"]
@@ -5414,7 +5424,7 @@ class ImageSources(unittest.TestCase):
                 Vision.load(str(f))
 
     # the test server is on 127.0.0.1, which the public-address guard refuses (serve/test_krait_launch.py tests that)
-    @mock.patch("serve.server.public_url_host", lambda url: None)
+    @mock.patch("serve.server.public_address", lambda host, port: "127.0.0.1")
     def test_a_url_is_read_up_to_the_cap(self):
         import http.server
         import serve.server as server

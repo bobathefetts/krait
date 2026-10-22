@@ -165,7 +165,11 @@ becomes 300 rows.
 Picture sources: by default only inline `data:` URLs. With `image_files` (`KRAIT_IMAGE_FILES=1`) the server also opens
 local paths, with the server's own file permissions. With `image_urls` (`KRAIT_IMAGE_URLS=1`) it downloads http(s)
 URLs, but only from public addresses: a host name that resolves to a private, loopback, link-local, multicast or
-otherwise non-global address is refused, and so is every redirect to one.
+otherwise non-global address is refused, and so is every redirect to one. The download then connects to the
+address that was checked (the Host header, TLS SNI and the certificate check still use the name), so a name that
+answers differently on a second lookup (DNS rebinding) cannot redirect it; it ignores HTTP(S)_PROXY. Change from
+upstream Strata: `serve/server.py` itself now treats a config without `image_files` / `image_urls` as off (upstream
+allowed both by default).
 
 ## Docker Compose (Krait + Open WebUI + embedder for RAG)
 

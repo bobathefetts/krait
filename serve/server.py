@@ -2502,7 +2502,9 @@ IMAGE_URL_MAX = 32 << 20        # an image URL is read up to this (the web app a
 # "image_files": false / "image_urls": false (Krait's krait/config.json does both), --image-files / --image-urls
 # turn them back on.  With URLs on, a URL whose host resolves to a private, loopback, link-local or otherwise
 # non-public address is refused, and so is every redirect to one (each redirect is checked again).
-IMAGE_SOURCES = {"files": True, "urls": True}
+# Krait (review 3): pictures from local files and from URLs are off unless the config or a flag turns them on
+# ("image_files" / "image_urls", --image-files / --image-urls); upstream Strata allowed both by default.
+IMAGE_SOURCES = {"files": False, "urls": False}
 
 
 class RequestDeadline(threading.Event):
@@ -2517,30 +2519,96 @@ class RequestDeadline(threading.Event):
         return super().is_set() or (self.deadline is not None and time.monotonic() >= self.deadline)
 
 
-def public_url_host(url: str) -> None:
-    """ValueError unless url is http(s) and every address its host resolves to is a public one."""
+def public_address(host: str, port: int) -> str:
+    """The address to connect to for host: every address it resolves to must be a public one (ValueError otherwise),
+    and the first is returned, so the connection goes to the address that was checked (no second DNS lookup that a
+    rebinding name could answer differently)."""
     import ipaddress
-    import urllib.parse
-    u = urllib.parse.urlsplit(url)
-    if u.scheme not in ("http", "https") or not u.hostname:
-        raise ValueError("an image URL must be http(s)://host/...")
     try:
-        infos = socket.getaddrinfo(u.hostname, u.port or (443 if u.scheme == "https" else 80), proto=socket.IPPROTO_TCP)
+        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
     except OSError as e:
         raise ValueError(f"the image URL's host could not be resolved ({e})") from None
+    first = None
     for info in infos:
-        ip = ipaddress.ip_address(info[4][0].split("%", 1)[0])
+        addr = info[4][0].split("%", 1)[0]
+        ip = ipaddress.ip_address(addr)
         if getattr(ip, "ipv4_mapped", None):
             ip = ip.ipv4_mapped
         if not ip.is_global or ip.is_multicast:
             raise ValueError("an image URL must point to a public address (private, loopback and link-local "
                              "addresses are refused)")
+        first = first or addr
+    if first is None:
+        raise ValueError("the image URL's host could not be resolved")
+    return first
+
+
+def public_url_host(url: str) -> str:
+    """ValueError unless url is http(s) and every address its host resolves to is a public one; the checked address."""
+    import urllib.parse
+    u = urllib.parse.urlsplit(url)
+    if u.scheme not in ("http", "https") or not u.hostname:
+        raise ValueError("an image URL must be http(s)://host/...")
+    return public_address(u.hostname, u.port or (443 if u.scheme == "https" else 80))
+
+
+import http.client as _http_client  # noqa: E402
+
+
+class _PinnedHTTPConnection(_http_client.HTTPConnection):
+    """Connects to the address public_address() checked; the Host header keeps the name."""
+    def __init__(self, host, *args, pinned_ip=None, **kwargs):
+        super().__init__(host, *args, **kwargs)
+        self.pinned_ip = pinned_ip
+
+    def connect(self):
+        self.sock = socket.create_connection((self.pinned_ip, self.port), self.timeout, self.source_address)
+
+
+class _PinnedHTTPSConnection(_http_client.HTTPSConnection):
+    """As _PinnedHTTPConnection over TLS: SNI and the certificate check use the name, the socket the checked address."""
+    def __init__(self, host, *args, pinned_ip=None, **kwargs):
+        super().__init__(host, *args, **kwargs)
+        self.pinned_ip = pinned_ip
+
+    def connect(self):
+        sock = socket.create_connection((self.pinned_ip, self.port), self.timeout, self.source_address)
+        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+
+
+def _pinned(cls, req):
+    """The connection class for req, bound to the checked public address of req's host (each redirect target is
+    checked again here, as it is opened)."""
+    import functools
+    import urllib.parse
+    u = urllib.parse.urlsplit(req.full_url)
+    if not u.hostname:
+        raise ValueError("an image URL must be http(s)://host/...")
+    ip = public_address(u.hostname, u.port or (443 if u.scheme == "https" else 80))
+    return functools.partial(cls, pinned_ip=ip)
+
+
+class _PinnedHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(_pinned(_PinnedHTTPConnection, req), req)
+
+
+class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(_pinned(_PinnedHTTPSConnection, req), req, context=self._context)
 
 
 class _CheckedRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         public_url_host(newurl)
         return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def image_url_opener():
+    """urllib opener for image URLs: no proxy (the connection must go to the checked address), every host checked
+    and pinned, redirects checked."""
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}), _PinnedHTTPHandler(), _PinnedHTTPSHandler(),
+                                       _CheckedRedirect())
 
 
 def network_path(path: str) -> bool:
@@ -2728,9 +2796,12 @@ class Vision:
     def load(source: str) -> bytes:
         if source.startswith("data:"):
             try:
-                return base64.b64decode(source.split(",", 1)[1])
+                data = base64.b64decode(re.sub(r"\s+", "", source.split(",", 1)[1]), validate=True)
             except (IndexError, ValueError) as e:                # no comma, or not base64
-                raise ValueError(f"the image's data: URL could not be read ({e})") from None
+                raise ValueError(f"the image's data: URL could not be read: it is not valid base64 ({e})") from None
+            if not data:
+                raise ValueError("the image's data: URL could not be read: it holds no data")
+            return data
         if source.startswith(("http://", "https://")):
             if not IMAGE_SOURCES["urls"]:
                 raise ValueError("image URLs are off on this server: send the picture as a data: URL "
@@ -2759,7 +2830,7 @@ class Vision:
         filled the memory.  One that cannot be read is a ValueError (a 400 that says so), not a dropped connection."""
         too_big = f"the image URL's file is over {IMAGE_URL_MAX >> 20} MiB"
         public_url_host(url)
-        opener = urllib.request.build_opener(_CheckedRedirect)
+        opener = image_url_opener()
         try:
             with opener.open(urllib.request.Request(url, headers={"User-Agent": "strata"}), timeout=60) as r:
                 size = r.headers.get("Content-Length") or ""
@@ -2796,8 +2867,8 @@ class Vision:
             import io
             from PIL import Image
         except ImportError:
-            raise ValueError("this image format needs Pillow (python -m pip install pillow); JPEG, PNG, BMP and "
-                             "GIF work without it") from None
+            raise ValueError("the image is not a JPEG, PNG, BMP or GIF file (it may be corrupt or not an image); other "
+                             "formats need Pillow (python -m pip install pillow)") from None
         try:
             im = Image.open(io.BytesIO(data))
             im.load()
@@ -8146,8 +8217,8 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     for key in ("image_files", "image_urls"):
         if key in cfg and type(cfg[key]) is not bool:
             ap.error(f"{key} must be true or false")
-    IMAGE_SOURCES["files"] = bool(a.image_files or cfg.get("image_files", True))
-    IMAGE_SOURCES["urls"] = bool(a.image_urls or cfg.get("image_urls", True))
+    IMAGE_SOURCES["files"] = bool(a.image_files or cfg.get("image_files", False))   # off unless asked (Krait)
+    IMAGE_SOURCES["urls"] = bool(a.image_urls or cfg.get("image_urls", False))
     max_tokens_cap = cfg.get("max_tokens_cap")
     if max_tokens_cap is not None and (isinstance(max_tokens_cap, bool) or not isinstance(max_tokens_cap, int)
                                        or not 1 <= max_tokens_cap <= 1 << 20):

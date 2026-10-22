@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from serve import server
@@ -164,6 +165,109 @@ class LaunchConfig(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stderr)
             r = self.run_lc(root, {"KRAIT_ALLOW_OPEN": "1"}, "--host", "0.0.0.0")
             self.assertEqual(r.returncode, 0, r.stderr)
+
+
+class PinnedDownload(unittest.TestCase):
+    """The download connects to the address that was checked (DNS rebinding), with the name kept for Host / SNI."""
+
+    def setUp(self):
+        import http.server, threading
+        self.saved = dict(IMAGE_SOURCES)
+        IMAGE_SOURCES.update(urls=True)
+        self.seen = []
+        seen = self.seen
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                seen.append(self.headers.get("Host"))
+                self.send_response(200)
+                self.send_header("Content-Length", "3")
+                self.end_headers()
+                self.wfile.write(b"PNG")
+
+            def log_message(self, *a):
+                pass
+
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.port = self.httpd.server_address[1]
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        IMAGE_SOURCES.clear()
+        IMAGE_SOURCES.update(self.saved)
+
+    def test_connects_to_the_checked_address_with_the_name_as_host(self):
+        import socket
+        real = socket.getaddrinfo
+        looked_up = []
+
+        def gai(host, *a, **k):
+            looked_up.append(host)
+            if host == "pinned.invalid":
+                raise AssertionError("the connection looked the name up again")
+            return real(host, *a, **k)
+
+        with mock.patch("serve.server.public_address", lambda host, port: "127.0.0.1"), \
+                mock.patch("socket.getaddrinfo", gai):
+            self.assertEqual(Vision.download(f"http://pinned.invalid:{self.port}/x.png"), b"PNG")
+        self.assertEqual(self.seen, [f"pinned.invalid:{self.port}"])
+        self.assertNotIn("pinned.invalid", looked_up)
+
+    def test_rebinding_name_is_refused(self):
+        import socket
+        calls = []
+
+        def gai(host, port, *a, **k):   # public on the first lookup, loopback afterwards
+            calls.append(host)
+            ip = "8.8.8.8" if len(calls) == 1 else "127.0.0.1"
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, port))]
+
+        with mock.patch("socket.getaddrinfo", gai), self.assertRaises(ValueError) as e:
+            Vision.download(f"http://rebind.invalid:{self.port}/x.png")
+        self.assertIn("public address", str(e.exception))
+        self.assertEqual(self.seen, [])            # the local server was never reached
+
+    def test_https_uses_the_name_for_sni(self):
+        got = {}
+
+        class Ctx:
+            def wrap_socket(self, sock, server_hostname=None):
+                got["sni"] = server_hostname
+                return sock
+
+        def cc(addr, *a, **k):
+            got["addr"] = addr
+            return object()
+
+        conn = server._PinnedHTTPSConnection("images.example.com", 443, pinned_ip="93.184.215.14", context=Ctx())
+        with mock.patch("socket.create_connection", cc):
+            conn.connect()
+        self.assertEqual(got, {"addr": ("93.184.215.14", 443), "sni": "images.example.com"})
+
+    def test_no_proxy(self):
+        import urllib.request
+        proxies = [h for h in server.image_url_opener().handlers if isinstance(h, urllib.request.ProxyHandler)]
+        # build_opener skips its default ProxyHandler (the environment's proxies) when one is given; an empty one opens nothing
+        self.assertTrue(all(h.proxies == {} for h in proxies))
+
+
+class DataUrls(unittest.TestCase):
+    def test_bad_base64_says_so(self):
+        for src in ("data:image/png;base64,@@@@", "data:image/png;base64,abc"):
+            with self.subTest(src=src), self.assertRaises(ValueError) as e:
+                Vision.load(src)
+            self.assertIn("not valid base64", str(e.exception))
+            self.assertNotIn("Pillow", str(e.exception))
+        with self.assertRaises(ValueError) as e:
+            Vision.load("data:image/png;base64,")
+        self.assertIn("no data", str(e.exception))
+
+    def test_server_defaults_off(self):
+        r = subprocess.run([sys.executable, "-c", "import serve.server as s; print(s.IMAGE_SOURCES)"], cwd=REPO,
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.stdout.strip(), "{'files': False, 'urls': False}", r.stderr)
 
 
 if __name__ == "__main__":
