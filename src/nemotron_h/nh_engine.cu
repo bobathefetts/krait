@@ -333,6 +333,7 @@ struct GraphIn {
     ggml_tensor *k_idxs = nullptr, *v_idxs = nullptr, *kq_mask = nullptr, *out_ids = nullptr, *logits = nullptr;
     ggml_tensor* h = nullptr;   // result_norm rows (the MTP head's input), when requested
     std::vector<ggml_tensor*> s_copy_r;   // rows mode: the recurrent-state index (slot) of each row
+    ggml_tensor* embd = nullptr;          // input rows (pictures, GENI) instead of token ids
 };
 
 struct DumpCtx {
@@ -1322,11 +1323,20 @@ struct Engine {
         gf = ggml_new_graph_custom(ctx0, max_nodes, false);
         const nh::Geometry& g = W.g;
         (void) pos0;
-        gi.tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T);
-        ggml_set_name(gi.tokens, "inp_tokens");
-        ggml_set_input(gi.tokens);
-        ggml_tensor* inpL = ggml_get_rows(ctx0, W.tok_embd, gi.tokens);
-        ggml_set_name(inpL, "embd");
+        ggml_tensor* inpL = nullptr;
+        if (embd_in) {
+            // a picture's rows (llama.cpp's build_inp_embd with batch.embd: the F32 rows are the layer input as they are)
+            gi.embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, g.n_embd, T);
+            ggml_set_name(gi.embd, "inp_embd");
+            ggml_set_input(gi.embd);
+            inpL = gi.embd;
+        } else {
+            gi.tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T);
+            ggml_set_name(gi.tokens, "inp_tokens");
+            ggml_set_input(gi.tokens);
+            inpL = ggml_get_rows(ctx0, W.tok_embd, gi.tokens);
+            ggml_set_name(inpL, "embd");
+        }
         ggml_build_forward_expand(gf, inpL);
         // build_inp_mem_hybrid: the attention inputs and the recurrent-state inputs
         gi.k_idxs = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, T);
@@ -1645,6 +1655,21 @@ struct Engine {
 
     void clear_slot(int slot) { M.n_past[(size_t) slot] = 0; }
 
+    // T rows of input embeddings (a picture, from strata-vision) at the slot's next positions; `tok` are the rows'
+    // placeholder ids (only checked for range).  Nemotron-H's attention has no rotary positions, so a picture's rows
+    // take the next T positions as text does (llama.cpp mtmd: one position per image token for this model).
+    const float* embd_in = nullptr;
+    void decode_embd(const float* rows, const int32_t* tok, int64_t T, int slot) {
+        embd_in = rows;
+        try {
+            decode(tok, T, slot, false);
+        } catch (...) {
+            embd_in = nullptr;
+            throw;
+        }
+        embd_in = nullptr;
+    }
+
     // one ubatch of tokens for `slot`; all_out: logits for every token, else for the last one only
     // verify_: a speculative verify batch (all outputs; every token computed as a T == 1 step would compute it; the
     // recurrent states keep T rollback snapshots, see spec_commit).  want_h_: also return the result_norm rows (hrows).
@@ -1725,7 +1750,8 @@ struct Engine {
         }
         build_graph(T, slot, pos0, n_kv, n_out, rs_zero, gi);
         if (!ggml_backend_sched_alloc_graph(sched, gf)) throw std::runtime_error("nh_engine: graph alloc failed");
-        ggml_backend_tensor_set(gi.tokens, tok, 0, (size_t) T * 4);
+        if (gi.embd) ggml_backend_tensor_set(gi.embd, embd_in, 0, (size_t) T * (size_t) W.g.n_embd * sizeof(float));
+        else ggml_backend_tensor_set(gi.tokens, tok, 0, (size_t) T * 4);
         {
             std::vector<int64_t> idx((size_t) T);
             const int64_t base = M.k.empty() ? 0 : (int64_t) slot * M.n_ctx * (M.n_slots > 1 ? 1 : 0);
@@ -2291,6 +2317,7 @@ struct Serve {
     };
     struct Sess {
         std::vector<int32_t> live;   // the tokens the slot's state holds (live.size() == E.M.n_past[slot])
+        bool img = false;            // the state holds pictures: never reused (the ids do not say which picture)
         bool active = false;         // a batch slot decoding
         uint64_t used = 0;
     };
@@ -2389,9 +2416,56 @@ struct Serve {
         std::fflush(stdout);
     }
 
+    // GENI: strata-vision records (int32 'SVE1', n, nx, ny, n_embd, then n x n_embd floats), one per picture in prompt
+    // order, laid over the prompt's runs of the image placeholder (<image>, id 18): the server writes
+    // <img> <image> x n </img> for a picture of n rows, as mtmd does for nemotron_omni (img_beg / img_end)
+    static constexpr int32_t kImageTok = 18;
+    struct PicRun { size_t start = 0, n = 0, row = 0; };
+    struct Pics { std::vector<float> rows; std::vector<PicRun> runs; };
+    std::string load_pictures(const std::string& path, const std::vector<int32_t>& ids, Pics& pc) {
+        const int64_t ne = E.W.g.n_embd;
+        std::vector<int64_t> ns;
+        std::FILE* f = std::fopen(path.c_str(), "rb");
+        if (!f) return "cannot open the embeddings file " + path;
+        std::string ve;
+        for (;;) {
+            int32_t hdr[5];
+            const size_t got = std::fread(hdr, sizeof(int32_t), 5, f);
+            if (got == 0) break;
+            if (got != 5 || hdr[0] != 0x31455653 || hdr[1] < 1 || hdr[4] != (int32_t) ne) {
+                ve = "bad embeddings file (expected strata-vision records of width " + std::to_string((long long) ne) + ")";
+                break;
+            }
+            const size_t off = pc.rows.size(), cnt = (size_t) hdr[1] * (size_t) ne;
+            pc.rows.resize(off + cnt);
+            if (std::fread(pc.rows.data() + off, sizeof(float), cnt, f) != cnt) { ve = "short embeddings file"; break; }
+            ns.push_back(hdr[1]);
+        }
+        std::fclose(f);
+        if (!ve.empty()) return ve;
+        if (ns.empty()) return "the embeddings file holds no picture";
+        size_t k = 0, row = 0;
+        for (size_t i = 0; i < ids.size();) {
+            if (ids[i] != kImageTok) { ++i; continue; }
+            size_t j = i;
+            while (j < ids.size() && ids[j] == kImageTok) ++j;
+            if (k >= ns.size()) return "the prompt has more pictures than the embeddings file";
+            if ((int64_t) (j - i) != ns[k])
+                return "picture " + std::to_string(k + 1) + " has " + std::to_string((long long) ns[k]) + " rows but " +
+                       std::to_string(j - i) + " placeholders";
+            pc.runs.push_back({i, j - i, row});
+            row += (size_t) ns[k];
+            ++k;
+            i = j;
+        }
+        if (k != ns.size()) return "the embeddings file has more pictures than the prompt";
+        if (ids.back() == kImageTok) return "the prompt cannot end in a picture";
+        return "";
+    }
+
     size_t match_len(const Sess& ss, const std::vector<int32_t>& ids) const {
         const size_t L = ss.live.size();
-        if (!prefix_reuse || L == 0 || L >= ids.size() || !std::equal(ss.live.begin(), ss.live.end(), ids.begin())) return 0;
+        if (!prefix_reuse || ss.img || L == 0 || L >= ids.size() || !std::equal(ss.live.begin(), ss.live.end(), ids.begin())) return 0;
         return L;
     }
 
@@ -2421,8 +2495,7 @@ struct Serve {
             err("expected: GEN <max_new> [key=value ...] <id,id,...>");
             return;
         }
-        if (geni) { err("this engine was started without --vision"); return; }
-        char* p = const_cast<char*>(line.c_str()) + (adm ? 5 : 4);
+        char* p = const_cast<char*>(line.c_str()) + (adm ? (geni ? 6 : 5) : (geni ? 5 : 4));
         int slot = -1;
         if (adm) {
             char* e1 = nullptr;
@@ -2457,6 +2530,13 @@ struct Serve {
             else if (key == "seed") smp.seed = std::strtoull(v, nullptr, 10);
             // other keys of server.py (ckpt, pin, cvec, img_keys, logit bias, tuning) are not used by this engine
         }
+        std::string img_path;
+        if (geni) {   // GENI <max_new> [keys] <embeddings file> <ids>
+            while (*p == ' ') ++p;
+            const char* f0 = p;
+            while (*p && *p != ' ') ++p;
+            img_path.assign(f0, (size_t) (p - f0));
+        }
         const std::vector<int32_t> ids = parse_ids(p);
         if (max_new < 1 || ids.empty()) { err("bad request: max_new or the ids"); return; }
         if ((int64_t) ids.size() + max_new > E.M.n_ctx) {
@@ -2466,6 +2546,11 @@ struct Serve {
         }
         for (int32_t t : ids)
             if (t < 0 || t >= nv) { err("a token id is outside the vocabulary"); return; }
+        Pics pics;
+        if (geni) {
+            const std::string e = load_pictures(img_path, ids, pics);
+            if (!e.empty()) { err(e); return; }
+        }
         stop.store(false);
         const int s = adm ? slot : pick_session(ids);
         Sess& ss = sess[(size_t) s];
@@ -2487,7 +2572,9 @@ struct Serve {
         if (reuse == 0) {
             E.clear_slot(s);
             ss.live.clear();
+            ss.img = false;
         }
+        if (!pics.runs.empty()) ss.img = true;
         ss.used = ++clock;
         const double t0 = now_s();
         const int64_t fresh = (int64_t) (ids.size() - reuse);
@@ -2495,8 +2582,17 @@ struct Serve {
         int64_t done = 0;
         // the prompt in --chunk ubatches from the first fresh token (a fresh prompt: the CLI's chunks exactly)
         for (size_t off = reuse; off < ids.size();) {
-            const int n = (int) std::min<size_t>((size_t) chunk, ids.size() - off);
-            E.decode(ids.data() + off, n, s, false);
+            // pictures: text and picture rows are read as separate runs, each in --chunk ubatches from its start (as
+            // llama.cpp's mtmd_helper_eval_chunks decodes a text chunk and an image chunk)
+            size_t end = ids.size();
+            const PicRun* in = nullptr;
+            for (const PicRun& r : pics.runs) {
+                if (off >= r.start && off < r.start + r.n) { in = &r; end = r.start + r.n; break; }
+                if (r.start > off) { end = r.start; break; }
+            }
+            const int n = (int) std::min<size_t>((size_t) chunk, end - off);
+            if (in) E.decode_embd(pics.rows.data() + (in->row + (off - in->start)) * (size_t) E.W.g.n_embd, ids.data() + off, n, s);
+            else E.decode(ids.data() + off, n, s, false);
             ss.live.insert(ss.live.end(), ids.begin() + (long) off, ids.begin() + (long) off + n);
             off += (size_t) n;
             done += n;

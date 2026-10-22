@@ -306,7 +306,10 @@ int main(int argc, char** argv) {
             const int n = (int) mtmd_input_chunk_get_n_tokens(ichunk);
             // the grid from the decoder positions (nx/ny getters are deprecated): x and y of the last token
             const mtmd_decoder_pos last = mtmd_image_tokens_get_decoder_pos(it, 0, (size_t) n - 1);
-            const int nx = (int) last.x + 1, ny = (int) last.y + 1;
+            int nx = (int) last.x + 1, ny = (int) last.y + 1;
+            // a model without M-RoPE (Nemotron 3.5 Super's nemotron_omni projector: one position per image token) has no
+            // 2-D grid to report: its rows are one line, n x 1
+            if (!mtmd_decode_use_mrope(ctx)) { nx = n; ny = 1; }
             if (nx * ny != n) err = "the image grid is not rectangular (" + std::to_string(n) + " tokens)";
             const float* embd = mtmd_get_output_embd(ctx);
             FILE* f = err.empty() ? std::fopen(out.c_str(), "wb") : nullptr;

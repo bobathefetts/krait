@@ -83,6 +83,7 @@ from serve import images as images_api  # noqa: E402
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
+NEMOTRON_IMAGE = "<image>"       # Nemotron 3.5 Super's picture marker (its chat template; mtmd's nemotron_omni rows)
 
 
 def popen(what: str, args: list, role: str = "engine", **kw):
@@ -2572,6 +2573,8 @@ class Vision:
             args += ["--max-tokens", str(cfg["max_tokens"])]
         if cfg.get("min_tokens"):                       # #767: mtmd's image_min_tokens (a hand-edited key)
             args += ["--min-tokens", str(cfg["min_tokens"])]
+        if cfg.get("flash_attn") in ("on", "off", "auto"):   # the encoder's attention (strata-vision --flash-attn)
+            args += ["--flash-attn", cfg["flash_attn"]]
         return args
 
     def _ensure_dir(self):
@@ -4665,8 +4668,11 @@ class Service:
             if self.vision is None:
                 raise ValueError("this server was started without the vision encoder (run setup again and choose "
                                  "'vision'), so it cannot read images")
-            pad = self.tok.encode(IMAGE_PAD, parse_special=True)[0]
-            start = self.tok.encode(VISION_START, parse_special=True)[0]
+            # Nemotron 3.5 Super (nemotron_h_moe): its template writes <image> for a picture; llama.cpp's mtmd
+            # (nemotron_omni) reads <img>, the picture's rows, </img> there - one <image> per row for the engine
+            nemotron = self.model_arch == "nemotron_h_moe"
+            pad = self.tok.encode(NEMOTRON_IMAGE if nemotron else IMAGE_PAD, parse_special=True)[0]
+            start = None if nemotron else self.tok.encode(VISION_START, parse_special=True)[0]
             # An image URL is downloaded first, outside the FIFO: under it, a slow server held every other request
             # for as long as urlopen waited.
             def fetch(src):
@@ -4691,8 +4697,19 @@ class Service:
             # #150) is kept as plain text, or it took an image's place and the counts no longer matched.
             literal = self.tok.encode(IMAGE_PAD, parse_special=False)
             out, k = [], 0
+            if nemotron:
+                beg = self.tok.encode("<img>", parse_special=True)
+                end = self.tok.encode("</img>", parse_special=True)
             for j, t in enumerate(ids):
-                if t == pad and j > 0 and ids[j - 1] == start:
+                if nemotron:
+                    if t == pad:
+                        if k == len(encoded):
+                            raise ValueError("the prompt and its images do not match")
+                        out += beg + [pad] * encoded[k][1] + end
+                        k += 1
+                    else:
+                        out.append(t)
+                elif t == pad and j > 0 and ids[j - 1] == start:
                     # more pairs than images: text parts that cut both markers apart (the literal marks keep whole ones text)
                     if k == len(encoded):
                         raise ValueError("the prompt and its images do not match")
