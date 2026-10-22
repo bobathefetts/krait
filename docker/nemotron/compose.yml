@@ -1,0 +1,76 @@
+# Strata (Nemotron 3.5 Super) + Open WebUI + a llama.cpp embedder for Open WebUI's document search (RAG).
+#
+#   cp docker/nemotron/env.example docker/nemotron/.env     # then set NH_MODELS and the two keys
+#   docker/nemotron/stage.sh                                # builds strata-nemotron:local from your build
+#   docker compose -f docker/nemotron/compose.yml up -d
+#   open http://127.0.0.1:3095 (Open WebUI; the first account made becomes the admin)
+#
+# NH_MODELS holds UD-Q4_K_XL/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-UD-Q4_K_XL-0000{1,2,3}-of-00003.gguf, mmproj-BF16.gguf
+# (pictures) and embed/nomic-embed-text-v1.5.Q8_0.gguf (the embedder).  Strata needs the NVIDIA Container Toolkit; the
+# embedder runs on the CPU, so the card is Strata's alone.  Every port binds to 127.0.0.1 only.
+name: strata-nemotron
+services:
+  strata:
+    image: ${STRATA_IMAGE:-strata-nemotron:local}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${STRATA_PORT:-8095}:8095"
+    environment:
+      STRATA_API_KEY: ${STRATA_API_KEY:?set STRATA_API_KEY in .env}
+    volumes:
+      - ${NH_MODELS:?set NH_MODELS in .env}:/opt/strata/models:ro
+      - strata-logs:/opt/strata/logs
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ulimits:
+      memlock: { soft: -1, hard: -1 }    # --pin page-locks the CPU-side experts
+    shm_size: 2gb
+    stop_grace_period: 2m
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://127.0.0.1:8095/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15m
+  embedder:
+    image: ${EMBED_IMAGE:-ghcr.io/ggml-org/llama.cpp:server}
+    restart: unless-stopped
+    command: ["-m", "/models/embed/nomic-embed-text-v1.5.Q8_0.gguf", "--alias", "nomic-embed-text-v1.5",
+              "--embeddings", "--host", "0.0.0.0", "--port", "8080", "-c", "8192", "-b", "2048", "-ub", "2048",
+              "--parallel", "4", "-t", "${EMBED_THREADS:-4}", "--api-key", "${EMBED_API_KEY:?set EMBED_API_KEY in .env}"]
+    ports:
+      - "127.0.0.1:${EMBED_PORT:-8096}:8080"
+    volumes:
+      - ${NH_MODELS:?set NH_MODELS in .env}:/models:ro
+  open-webui:
+    image: ${WEBUI_IMAGE:-ghcr.io/open-webui/open-webui:v0.11.4}
+    restart: unless-stopped
+    depends_on: [strata, embedder]
+    ports:
+      - "127.0.0.1:${WEBUI_PORT:-3095}:8080"
+    environment:
+      ENABLE_OLLAMA_API: "false"
+      ENABLE_OPENAI_API: "true"
+      OPENAI_API_BASE_URL: http://strata:8095/v1
+      OPENAI_API_KEY: ${STRATA_API_KEY}
+      RAG_EMBEDDING_ENGINE: openai
+      RAG_OPENAI_API_BASE_URL: http://embedder:8080/v1
+      RAG_OPENAI_API_KEY: ${EMBED_API_KEY}
+      RAG_EMBEDDING_MODEL: nomic-embed-text-v1.5
+      RAG_EMBEDDING_QUERY_PREFIX: "search_query: "      # nomic-embed-text wants these task prefixes
+      RAG_EMBEDDING_CONTENT_PREFIX: "search_document: "
+      CHUNK_SIZE: "1000"
+      CHUNK_OVERLAP: "100"
+      RAG_TOP_K: "3"
+      OFFLINE_MODE: "true"                               # no Hugging Face downloads: embeddings come from the embedder
+      WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY:?set WEBUI_SECRET_KEY in .env}
+    volumes:
+      - open-webui-data:/app/backend/data
+volumes:
+  strata-logs:
+  open-webui-data:
