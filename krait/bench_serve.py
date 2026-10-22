@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""nemotron/bench_serve.py - the one-command benchmark of the Strata server on Nemotron 3.5 Super.
+"""krait/bench_serve.py - the one-command benchmark of the Krait server on Nemotron 3.5 Super.
 
-    nemotron/bench_serve.py [--url http://127.0.0.1:8095] [--out reports/serve_bench] [--max-tokens 256] [--conc 1,2,4]
+    krait/bench_serve.py [--url http://127.0.0.1:8095] [--out reports/serve_bench] [--max-tokens 256] [--conc 1,2,4]
 
-Without --url it starts nemotron/run-nemotron.sh (its own port, 8097), waits for /health and stops it at the end.
+Without --url it starts krait/krait (its own port, 8097), waits for /health and stops it at the end.
 It sends the same six prompts every time (OpenAI /v1/chat/completions, streaming, temperature 0, thinking off, so every
 run produces the same tokens), and measures:
   single  - one request at a time: time to first token (client clock), the engine's prompt and decode rates
@@ -96,7 +96,7 @@ def wait_ready(url, proc, limit_s=900):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--url", help="a running server (default: start nemotron/run-nemotron.sh on --port)")
+    ap.add_argument("--url", help="a running server (default: start krait/krait on --port)")
     ap.add_argument("--port", type=int, default=8097)
     ap.add_argument("--out", default="reports/serve_bench")
     ap.add_argument("--max-tokens", type=int, default=256)
@@ -109,7 +109,7 @@ def main():
     if not url:
         url = f"http://127.0.0.1:{a.port}"
         logf = open(out / "server.log", "w")
-        proc = subprocess.Popen([str(HERE / "run-nemotron.sh")], env={**os.environ, "PORT": str(a.port)},
+        proc = subprocess.Popen([str(HERE / "krait")], env={**os.environ, "PORT": str(a.port)},
                                 stdout=logf, stderr=subprocess.STDOUT, start_new_session=True)
     try:
         health, ready_s = wait_ready(url, proc)

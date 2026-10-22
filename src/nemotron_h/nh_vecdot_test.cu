@@ -3,6 +3,9 @@
 // engine runs), on the real routed experts of every MoE layer of the model and random activations.  Exit 0 only if
 // every output row and every q8_0 byte matches.  Also times the kernels for a 22-expert decode layer.
 #include "strata/artifact/gguf_reader.hpp"
+#ifndef NH_VECDOT_BIN
+#error "NH_VECDOT_BIN comes from nemotron/project.env through CMakeLists.txt"
+#endif
 #include "strata/artifact/gguf_split.hpp"
 #include "strata/nemotron_h/layout.hpp"
 
@@ -57,7 +60,7 @@ int main(int argc, char** argv) {
         else if (a == "--inputs" && i + 1 < argc) n_x = std::stoi(argv[++i]);
     }
     if (model.empty()) {
-        std::fprintf(stderr, "usage: strata-nh-vecdot-test --model SHARD [--experts 4] [--inputs 2]\n");
+        std::fprintf(stderr, "usage: " NH_VECDOT_BIN " --model SHARD [--experts 4] [--inputs 2]\n");
         return 2;
     }
     ggml_cpu_init();

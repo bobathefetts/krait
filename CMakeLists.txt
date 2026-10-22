@@ -265,6 +265,17 @@ add_executable(strata-dequant src/artifact/dequant.cpp)
 target_link_libraries(strata-dequant PRIVATE strata_artifact)
 # this file is now nothing but the CLI entry point, and its inherited guard spells that as a "selftest"
 target_compile_definitions(strata-dequant PRIVATE STRATA_DEQUANT_SELFTEST)
+# the Nemotron port's names (krait/project.env): NH_PROJECT_NAME, NH_PROJECT_SLUG, NH_ENGINE_BIN, NH_LAYOUT_BIN, ...
+file(STRINGS ${CMAKE_CURRENT_SOURCE_DIR}/krait/project.env _nh_names REGEX "^[A-Z_]+=")
+foreach(_nh_line IN LISTS _nh_names)
+  if(_nh_line MATCHES "^([A-Z_]+)=\"?([^\"]*)\"?$")
+    set(NH_${CMAKE_MATCH_1} "${CMAKE_MATCH_2}")
+  endif()
+endforeach()
+if(NOT NH_ENGINE_BIN OR NOT NH_LAYOUT_BIN OR NOT NH_VECDOT_BIN)
+  message(FATAL_ERROR "krait/project.env must set ENGINE_BIN, LAYOUT_BIN and VECDOT_BIN")
+endif()
+
 if(STRATA_BUILD_TESTS)
   add_executable(batch_telemetry_test src/core/batch_telemetry_test.cpp)
   target_include_directories(batch_telemetry_test PRIVATE include)
@@ -285,7 +296,7 @@ if(STRATA_BUILD_TESTS)
   target_link_libraries(model_family_test PRIVATE strata_artifact)
   add_test(NAME model_family_test COMMAND model_family_test)
   # Nemotron 3.5 Super (nemotron_h_moe): geometry, layout check, GGUF arrays and family name on synthetic GGUFs; the
-  # same program writes the tiny files the strata-nh-layout / strata-nh-engine exit-code tests below read
+  # same program writes the tiny files the layout / engine exit-code tests below read
   add_executable(nemotron_h_layout_test tests/core/nemotron_h_layout_test.cpp)
   target_link_libraries(nemotron_h_layout_test PRIVATE strata_artifact)
   add_test(NAME nemotron_h_layout_test COMMAND nemotron_h_layout_test)
@@ -763,16 +774,17 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_executable(strata-q36ref src/qwen35/q36ref.cu)
   target_include_directories(strata-q36ref PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
   target_link_libraries(strata-q36ref PRIVATE strata_kernels strata_warnings ${_strata_gpu_runtime_target})
-  # Nemotron 3.5 Super (nemotron_h_moe), docs/NEMOTRON.md: the layout check (all shards, every tensor mapped and
+  # Nemotron 3.5 Super (nemotron_h_moe), docs/KRAIT.md: the layout check (all shards, every tensor mapped and
   # verified; the mmproj opened but unused)
-  add_executable(strata-nh-layout src/nemotron_h/nh_layout_main.cpp)
-  target_include_directories(strata-nh-layout PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-  target_link_libraries(strata-nh-layout PRIVATE strata_warnings)
+  add_executable(${NH_LAYOUT_BIN} src/nemotron_h/nh_layout_main.cpp)
+  target_include_directories(${NH_LAYOUT_BIN} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(${NH_LAYOUT_BIN} PRIVATE strata_warnings)
+  target_compile_definitions(${NH_LAYOUT_BIN} PRIVATE NH_LAYOUT_BIN="${NH_LAYOUT_BIN}")
   if(STRATA_BUILD_TESTS)   # exit codes on the tiny files nemotron_h_layout_test writes (no model, no GPU)
     set(_nh_fix ${CMAKE_CURRENT_BINARY_DIR}/nemotron_h_fixtures)
     set(_nh_expect ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/expect_exit.cmake)
-    add_test(NAME nh_layout_cli_ok COMMAND strata-nh-layout --model ${_nh_fix}/tiny-ok.gguf)
-    add_test(NAME nh_layout_cli_missing COMMAND ${CMAKE_COMMAND} "-DPROG=$<TARGET_FILE:strata-nh-layout>"
+    add_test(NAME nh_layout_cli_ok COMMAND ${NH_LAYOUT_BIN} --model ${_nh_fix}/tiny-ok.gguf)
+    add_test(NAME nh_layout_cli_missing COMMAND ${CMAKE_COMMAND} "-DPROG=$<TARGET_FILE:${NH_LAYOUT_BIN}>"
       "-DARGS=--model|${_nh_fix}/tiny-missing.gguf" -DEXPECT=1 "-DMATCH=missing tensor blk.0.ssm_in.weight"
       -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/expect_exit.cmake)
     set_tests_properties(nh_layout_cli_ok nh_layout_cli_missing PROPERTIES FIXTURES_REQUIRED nemotron_h_fixtures)
@@ -783,36 +795,38 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(strata-nhref PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
   target_link_libraries(strata-nhref PRIVATE strata_warnings ${_strata_gpu_runtime_target} ${_strata_gpu_blas_target})
   # the Phase 2 engine for the same family (src/nemotron_h/nh_engine.cu): llama.cpp's ggml kernels (ggml-cuda +
-  # ggml-cpu, a SEPARATE shared build of the reference sources: STRATA_NH_GGML_INCLUDE = <llama.cpp>/ggml/include,
-  # STRATA_NH_GGML_LIBDIR = that build's bin/) on a graph and scheduler Strata builds, so Gate 2 can hold it to
+  # ggml-cpu, a SEPARATE shared build of the reference sources: KRAIT_GGML_INCLUDE = <llama.cpp>/ggml/include,
+  # KRAIT_GGML_LIBDIR = that build's bin/) on a graph and scheduler Strata builds, so Gate 2 can hold it to
   # llama.cpp's numerics.  Only configured when both paths are given.
-  set(STRATA_NH_GGML_INCLUDE "" CACHE PATH "ggml/include of the llama.cpp sources strata-nh-engine runs on")
-  set(STRATA_NH_GGML_LIBDIR "" CACHE PATH "directory with libggml*.so (CUDA + CPU) built from those sources")
-  if(STRATA_NH_GGML_INCLUDE AND STRATA_NH_GGML_LIBDIR)
-    add_executable(strata-nh-engine src/nemotron_h/nh_engine.cu)
-    target_include_directories(strata-nh-engine BEFORE PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    target_include_directories(strata-nh-engine SYSTEM BEFORE PRIVATE ${STRATA_NH_GGML_INCLUDE})
-    target_link_libraries(strata-nh-engine PRIVATE strata_warnings
-      ${STRATA_NH_GGML_LIBDIR}/libggml.so ${STRATA_NH_GGML_LIBDIR}/libggml-base.so
-      ${STRATA_NH_GGML_LIBDIR}/libggml-cpu.so ${STRATA_NH_GGML_LIBDIR}/libggml-cuda.so)
-    set_target_properties(strata-nh-engine PROPERTIES CUDA_RUNTIME_LIBRARY Shared BUILD_RPATH ${STRATA_NH_GGML_LIBDIR})
+  set(KRAIT_GGML_INCLUDE "" CACHE PATH "ggml/include of the llama.cpp sources ${NH_ENGINE_BIN} runs on")
+  set(KRAIT_GGML_LIBDIR "" CACHE PATH "directory with libggml*.so (CUDA + CPU) built from those sources")
+  if(KRAIT_GGML_INCLUDE AND KRAIT_GGML_LIBDIR)
+    add_executable(${NH_ENGINE_BIN} src/nemotron_h/nh_engine.cu)
+    target_include_directories(${NH_ENGINE_BIN} BEFORE PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_include_directories(${NH_ENGINE_BIN} SYSTEM BEFORE PRIVATE ${KRAIT_GGML_INCLUDE})
+    target_link_libraries(${NH_ENGINE_BIN} PRIVATE strata_warnings
+      ${KRAIT_GGML_LIBDIR}/libggml.so ${KRAIT_GGML_LIBDIR}/libggml-base.so
+      ${KRAIT_GGML_LIBDIR}/libggml-cpu.so ${KRAIT_GGML_LIBDIR}/libggml-cuda.so)
+    target_compile_definitions(${NH_ENGINE_BIN} PRIVATE NH_ENGINE_BIN="${NH_ENGINE_BIN}")
+    set_target_properties(${NH_ENGINE_BIN} PROPERTIES CUDA_RUNTIME_LIBRARY Shared BUILD_RPATH ${KRAIT_GGML_LIBDIR})
     # bit-exactness test of the CPU-exact expert kernels (nh_cpuexact.cuh) against ggml-cpu
-    add_executable(strata-nh-vecdot-test src/nemotron_h/nh_vecdot_test.cu)
-    target_include_directories(strata-nh-vecdot-test BEFORE PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    target_include_directories(strata-nh-vecdot-test SYSTEM BEFORE PRIVATE ${STRATA_NH_GGML_INCLUDE})
-    target_link_libraries(strata-nh-vecdot-test PRIVATE strata_warnings
-      ${STRATA_NH_GGML_LIBDIR}/libggml.so ${STRATA_NH_GGML_LIBDIR}/libggml-base.so ${STRATA_NH_GGML_LIBDIR}/libggml-cpu.so)
-    set_target_properties(strata-nh-vecdot-test PROPERTIES CUDA_RUNTIME_LIBRARY Shared BUILD_RPATH ${STRATA_NH_GGML_LIBDIR})
+    add_executable(${NH_VECDOT_BIN} src/nemotron_h/nh_vecdot_test.cu)
+    target_include_directories(${NH_VECDOT_BIN} BEFORE PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_include_directories(${NH_VECDOT_BIN} SYSTEM BEFORE PRIVATE ${KRAIT_GGML_INCLUDE})
+    target_link_libraries(${NH_VECDOT_BIN} PRIVATE strata_warnings
+      ${KRAIT_GGML_LIBDIR}/libggml.so ${KRAIT_GGML_LIBDIR}/libggml-base.so ${KRAIT_GGML_LIBDIR}/libggml-cpu.so)
+    target_compile_definitions(${NH_VECDOT_BIN} PRIVATE NH_VECDOT_BIN="${NH_VECDOT_BIN}")
+    set_target_properties(${NH_VECDOT_BIN} PROPERTIES CUDA_RUNTIME_LIBRARY Shared BUILD_RPATH ${KRAIT_GGML_LIBDIR})
     if(STRATA_BUILD_TESTS)   # the engine's refusals before it touches the GPU (tiny files, no model)
-      set(_nh_eng ${CMAKE_COMMAND} "-DPROG=$<TARGET_FILE:strata-nh-engine>")
+      set(_nh_eng ${CMAKE_COMMAND} "-DPROG=$<TARGET_FILE:${NH_ENGINE_BIN}>")
       set(_nh_x ${CMAKE_CURRENT_SOURCE_DIR}/cmake/expect_exit.cmake)
-      add_test(NAME nh_engine_cli_usage COMMAND ${_nh_eng} -DEXPECT=2 "-DMATCH=usage: strata-nh-engine" -P ${_nh_x})
+      add_test(NAME nh_engine_cli_usage COMMAND ${_nh_eng} -DEXPECT=2 "-DMATCH=usage: ${NH_ENGINE_BIN}" -P ${_nh_x})
       add_test(NAME nh_engine_cli_missing COMMAND ${_nh_eng} "-DARGS=--serve|--model|${_nh_fix}/tiny-missing.gguf"
         -DEXPECT=3 "-DMATCH=GGUF layout check failed" -P ${_nh_x})
       add_test(NAME nh_engine_cli_arch COMMAND ${_nh_eng} "-DARGS=--serve|--model|${_nh_fix}/tiny-arch.gguf"
         -DEXPECT=1 "-DMATCH=expected 'nemotron_h_moe'" -P ${_nh_x})
       add_test(NAME nh_engine_cli_nofile COMMAND ${_nh_eng} "-DARGS=--serve|--model|${_nh_fix}/no-such-file.gguf"
-        -DEXPECT=1 "-DMATCH=strata-nh-engine: error" -P ${_nh_x})
+        -DEXPECT=1 "-DMATCH=${NH_ENGINE_BIN}: error" -P ${_nh_x})
       set_tests_properties(nh_engine_cli_usage nh_engine_cli_missing nh_engine_cli_arch nh_engine_cli_nofile
         PROPERTIES FIXTURES_REQUIRED nemotron_h_fixtures)
     endif()

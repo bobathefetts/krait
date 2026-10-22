@@ -9,8 +9,8 @@ from pathlib import Path
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--url", default="http://127.0.0.1:3095")
-ap.add_argument("--email", default="smoke@strata.local")
-ap.add_argument("--password", default="strata-smoke-test")
+ap.add_argument("--email", default="smoke@krait.local")
+ap.add_argument("--password", default="krait-smoke-test")
 ap.add_argument("--out", default=".")
 ap.add_argument("--image", help="a picture to ask about (optional)")
 ap.add_argument("--image-question", default="What color is the circle? Answer in one word.")
@@ -68,7 +68,7 @@ case("account", token, status=r["status"], role=(r.get("json") or {}).get("role"
 if not token: (out / "smoke.json").write_text(json.dumps(results, indent=1)); sys.exit(1)
 
 model = None
-while time.monotonic() - t0 < a.timeout:   # Open WebUI lists Strata's model once Strata answers /v1/models
+while time.monotonic() - t0 < a.timeout:   # Open WebUI lists Krait's model once Krait answers /v1/models
     r = req("GET", "/api/models")
     ids = [m.get("id") for m in (r.get("json") or {}).get("data", [])]
     if ids: model = ids[0]; break
@@ -117,7 +117,7 @@ fact = (f"Section 5. Calibration of the test rig. The quarterly calibration of t
 sections.insert(4, fact * 2)
 doc = "Facilities handbook (internal)\n\n" + "\n\n".join(sections) + "\n"
 (out / "rag_document.txt").write_text(doc)
-bnd = "----strata" + uuid.uuid4().hex
+bnd = "----krait" + uuid.uuid4().hex
 body = (f"--{bnd}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"facilities_handbook.txt\"\r\n"
         f"Content-Type: text/plain\r\n\r\n").encode() + doc.encode() + f"\r\n--{bnd}--\r\n".encode()
 r = req("POST", "/api/v1/files/", raw=body, ctype=f"multipart/form-data; boundary={bnd}")

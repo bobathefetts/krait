@@ -31,6 +31,9 @@
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/artifact/gguf_split.hpp"
 #include "strata/nemotron_h/layout.hpp"
+#ifndef NH_ENGINE_BIN
+#error "NH_ENGINE_BIN comes from krait/project.env through CMakeLists.txt"
+#endif
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -2330,12 +2333,12 @@ struct Serve {
     double window_s = 0;
     int read_windows = 1;
     FILE* trace = nullptr;
-    bool prefix_reuse = true;   // --prefix-reuse on|off   // STRATA_NH_TRACE=<file>: one JSON line per finished request (prompt ids, generated ids)
+    bool prefix_reuse = true;   // --prefix-reuse on|off   // KRAIT_TRACE=<file>: one JSON line per finished request (prompt ids, generated ids)
 
     Serve(Engine& e, const SpecCfg& sc, int ch, const std::set<int>& eg)
         : E(e), spec(sc), chunk(ch), eog(eg), nv(e.W.g.n_vocab), slots((size_t) e.M.n_slots), sess((size_t) e.M.n_slots) {
         if (const char* v = std::getenv("STRATA_NH_READ_WINDOWS")) read_windows = std::max(0, std::min(64, std::atoi(v)));
-        if (const char* v = std::getenv("STRATA_NH_TRACE"))
+        if (const char* v = std::getenv("KRAIT_TRACE"))
             if (*v && !(trace = std::fopen(v, "a"))) std::fprintf(stderr, "[nh_serve] cannot open the trace file %s\n", v);
     }
     ~Serve() {
@@ -2711,7 +2714,7 @@ struct Serve {
     }
 
     int run() {
-        std::printf("INFO engine=strata-nh-engine arch=nemotron_h_moe kv_slots=%d spec=%d expert_cache_mib=%.0f\n", n_sess(), spec.mode,
+        std::printf("INFO engine=" NH_ENGINE_BIN " arch=nemotron_h_moe kv_slots=%d spec=%d expert_cache_mib=%.0f\n", n_sess(), spec.mode,
                     E.C.pool_bytes / 1048576.0);
         if (n_sess() > 1) std::printf("INFO batch_slots=%d slot_cache=1\n", n_sess());
         std::fprintf(stderr, "[nh_serve] prefix reuse %s\n", prefix_reuse ? "on" : "off (every prompt is read from position 0, as the CLI does)");
@@ -2858,14 +2861,14 @@ int real_main(int argc, char** argv) {
         }
     }
     if (model.empty() || ((list.empty() || tokdir.empty() || outdir.empty()) && bench.empty() && !serve_mode)) {
-        std::fprintf(stderr, "usage: strata-nh-engine --model SHARD --list LIST --tokdir DIR --out RAWDIR [--k 32] "
+        std::fprintf(stderr, "usage: " NH_ENGINE_BIN " --model SHARD --list LIST --tokdir DIR --out RAWDIR [--k 32] "
                              "[--chunk 512] [--ctx 32768] [--threads 16] [--n-cpu-moe 68] [--force RAWDIR] [--only ids] "
-                             "[--dump-sums FILE --dump-prompt ID]\n       strata-nh-engine --model SHARD --bench FILE --bench-out JSONL "
+                             "[--dump-sums FILE --dump-prompt ID]\n       " NH_ENGINE_BIN " --model SHARD --bench FILE --bench-out JSONL "
                              "[--profile NTOK] [--chunk 512] [--ctx 32768] [--threads 16] [--n-cpu-moe 68]\n"
                              "       either: [--pin] [--cache lo|all|off] [--cache-mib N] [--cap-lo N] [--cap-hi N] "
                              "[--cache-decay 0.97] [--max-admit 2] [--vram-reserve-mib 2048] [--vram-limit-mib N]\n"
                              "       [--spec off|ngram|mtp|auto] [--spec-k 1..3] [--spec-min-acc X] [--mtp-topk N] [--spec-check]\n"
-                             "       strata-nh-engine --serve --model SHARD [--batch 2..4] [--ctx N] [the cache/spec options]\n");
+                             "       " NH_ENGINE_BIN " --serve --model SHARD [--batch 2..4] [--ctx N] [the cache/spec options]\n");
         return 2;
     }
     const std::set<std::string> only_ids = split_ids(only);
@@ -3070,7 +3073,7 @@ int real_main(int argc, char** argv) {
     }
     FILE* sumf = std::fopen((outdir + "/capture_log.txt").c_str(), "w");
     if (!sumf) throw std::runtime_error("cannot write " + outdir + "/capture_log.txt");
-    std::fprintf(sumf, "engine=strata-nh-engine n_vocab=%d n_ctx=%d K=%d chunk=%d force=%s n_cpu_moe=%d threads=%d\n", nv,
+    std::fprintf(sumf, "engine=" NH_ENGINE_BIN " n_vocab=%d n_ctx=%d K=%d chunk=%d force=%s n_cpu_moe=%d threads=%d\n", nv,
                  ctx, K, chunk, force.c_str(), n_cpu_moe, threads);
     std::ifstream lf(list);
     std::string id;
@@ -3170,7 +3173,7 @@ int main(int argc, char** argv) {
     try {
         return real_main(argc, argv);
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "strata-nh-engine: error: %s\n", e.what());
+        std::fprintf(stderr, NH_ENGINE_BIN ": error: %s\n", e.what());
         return 1;
     }
 }

@@ -6,6 +6,9 @@
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/artifact/gguf_split.hpp"
 #include "strata/nemotron_h/layout.hpp"
+#ifndef NH_LAYOUT_BIN
+#error "NH_LAYOUT_BIN comes from nemotron/project.env through CMakeLists.txt"
+#endif
 
 #include <cstdio>
 #include <cstring>
@@ -48,7 +51,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--table")) table = argv[++i];
     }
     if (model.empty()) {
-        std::fprintf(stderr, "usage: strata-nh-layout --model <shard> [--mmproj f] [--table f]\n");
+        std::fprintf(stderr, "usage: " NH_LAYOUT_BIN " --model <shard> [--mmproj f] [--table f]\n");
         return 2;
     }
     try {

@@ -86,7 +86,7 @@ node_modules/
 /apps/host/docs/evidence/
 /apps/host/docs/checkpoints/
 
-# docker/nemotron: the keys (made from env.example)
-docker/nemotron/.env
-# nemotron/build-nemotron.sh with NH_ROOT = this checkout: the fetched llama.cpp sources
+# docker/krait: the keys (made from env.example)
+docker/krait/.env
+# krait/build.sh with KRAIT_ROOT = this checkout: the fetched llama.cpp sources
 /third_party/llama.cpp-*

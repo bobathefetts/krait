@@ -1,10 +1,13 @@
-# Nemotron 3.5 Super on Strata
+# Krait: Nemotron 3.5 Super
+
+Krait is based on Strata by Niko1221 (github.com/Niko1221/Strata, MIT).
 
 This port runs **NVIDIA Nemotron 3.5 Super VL 120B-A12B** (GGUF architecture `nemotron_h_moe`: Mamba-2 + attention
 without RoPE + LatentMoE, one MTP block) on a single 32 GB NVIDIA card with the routed experts of most layers in host
-RAM. It has its own engine, `strata-nh-engine` (src/nemotron_h/), built on llama.cpp's ggml kernels (b11806) with a
+RAM. It has its own engine, `krait-engine` (src/nemotron_h/), built on llama.cpp's ggml kernels (b11806) with a
 graph, expert cache and scheduler of its own. The server (`serve/server.py`, OpenAI + Anthropic API, web page) and the
-vision encoder (`strata-vision`, llama.cpp's mtmd) are Strata's, with the Nemotron changes listed below.
+vision encoder (upstream `strata-vision` on llama.cpp's mtmd, installed as `krait-vision`) are Strata's, with the
+Nemotron changes described below (Run, Pictures).
 
 Tested file: Unsloth's `NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-UD-Q4_K_XL` (3 shards) and `mmproj-BF16.gguf`.
 
@@ -27,7 +30,7 @@ The test machine (one 32 GB NVIDIA card, WSL2). Every run with
 tok/s = (n - 1) / (t_last - t_first). llama.cpp b11806 was run fresh on the same machine with the same placement
 (`--n-cpu-moe 68`).
 
-| | Strata | llama.cpp b11806 |
+| | Krait | llama.cpp b11806 |
 |---|---|---|
 | decode, real prompts (CLI) | **23.016 tok/s** (1.609x) | 14.300 tok/s |
 | decode, one HTTP stream (6 prompts, thinking off) | 24.6 tok/s median | - |
@@ -47,35 +50,35 @@ CPU. `--batch` lets several users share the model; it does not make it faster.
 Linux (or WSL2) with a CUDA toolkit, cmake >= 3.21, ninja, gcc and python3:
 
 ```bash
-nemotron/build-nemotron.sh            # NH_ROOT=<work dir> CUDA_ARCH=120 JOBS=16 (defaults: two levels up, 120, nproc)
+krait/build.sh            # KRAIT_ROOT=<work dir> CUDA_ARCH=120 JOBS=16 (defaults: two levels up, 120, nproc)
 ```
 
 It fetches llama.cpp b11806 (`0682a576a`, the engine's ggml and the encoder's mtmd) and the commit `setup.py` pins
-for the rest of Strata (`3cf03257`), then builds `build/ggml-nh`, `build/strata/strata-nh-engine`,
-`build/strata/strata-nh-layout` and `build/vision/strata-vision` under NH_ROOT.
+for the rest of Strata (`3cf03257`), then builds `build/ggml-nh`, `build/krait/krait-engine`,
+`build/krait/krait-layout` and `build/vision/krait-vision` under KRAIT_ROOT.
 
 Two llama.cpp versions on purpose: Strata's own CUDA kernels (src/prefill/moe_mmq.cu and the other MMQ files) compile
 only against the commit setup.py pins. Pointing `STRATA_GGML_DIR` at a newer llama.cpp breaks them (for example
 `ggml_cuda_host.cu: declaration is incompatible with ... new_pool_for_device`). The Nemotron engine needs b11806, so it
-takes its ggml from `STRATA_NH_GGML_INCLUDE` / `STRATA_NH_GGML_LIBDIR` instead.
+takes its ggml from `KRAIT_GGML_INCLUDE` / `KRAIT_GGML_LIBDIR` instead.
 
 The model and the tokenizer pack:
 
 ```
-NH_ROOT/models/UD-Q4_K_XL/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-UD-Q4_K_XL-0000{1,2,3}-of-00003.gguf
-NH_ROOT/models/mmproj-BF16.gguf
-python3 tools/strata_tokenizer.py --gguf NH_ROOT/models/UD-Q4_K_XL/...-00001-of-00003.gguf --out NH_ROOT/pack/nemotron/tokenizer
-build/strata/strata-nh-layout --model <shard 1> --mmproj models/mmproj-BF16.gguf     # checks every tensor
+KRAIT_ROOT/models/UD-Q4_K_XL/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-UD-Q4_K_XL-0000{1,2,3}-of-00003.gguf
+KRAIT_ROOT/models/mmproj-BF16.gguf
+python3 tools/strata_tokenizer.py --gguf KRAIT_ROOT/models/UD-Q4_K_XL/...-00001-of-00003.gguf --out KRAIT_ROOT/pack/nemotron/tokenizer
+build/krait/krait-layout --model <shard 1> --mmproj models/mmproj-BF16.gguf     # checks every tensor
 ```
 
 ## Run
 
 ```bash
-NH_ROOT=<work dir> nemotron/run-nemotron.sh            # http://127.0.0.1:8095/v1, also HOST=, PORT=, NH_CONFIG=
-STRATA_API_KEY=<key> HOST=0.0.0.0 nemotron/run-nemotron.sh   # on the network: set a key
+KRAIT_ROOT=<work dir> krait/krait            # http://127.0.0.1:8095/v1, also HOST=, PORT=, KRAIT_CONFIG=
+KRAIT_API_KEY=<key> HOST=0.0.0.0 krait/krait   # on the network: set a key
 ```
 
-`nemotron/strata-nemotron.json` holds the engine flags (paths relative to NH_ROOT). Its `vision` section turns
+`krait/config.json` holds the engine flags (paths relative to KRAIT_ROOT). Its `vision` section turns
 pictures on. The encoder runs on the CPU (`threads`, `"flash_attn": "on"`, which matches llama.cpp's `-fa on`), so it
 uses no VRAM.
 
@@ -83,13 +86,13 @@ uses no VRAM.
 |---|---|---|
 | `--n-cpu-moe 68` | yes | the routed experts of the first 68 MoE layers stay in host RAM (read by the CPU or cached on the card) |
 | `--cache all` | yes | a VRAM cache of hot experts for those layers (123 slots per layer solo, 111 with `--batch 4`) |
-| `--pin` | yes | page-locks the host expert ranges (needs a memlock limit of unlimited, as in docker/nemotron/compose.yml) |
+| `--pin` | yes | page-locks the host expert ranges (needs a memlock limit of unlimited, as in docker/krait/compose.yml) |
 | `--spec mtp --spec-k 1 --spec-min-acc 0.6` | yes | MTP speculation with the model's own draft block; drafting pauses while the acceptance average is under 0.6 |
 | `--chunk 512`, `--max-context 32768`, `--threads 16` | yes | prompt chunk, context, CPU threads |
 | `--vram-limit-mib N` | 29346 | the engine keeps its whole VRAM use under N MiB |
 | `--batch 2..4` | 4 | up to 4 requests decode together (rows mode); without it requests take turns |
 | `--prefix-reuse on\|off` | **off** | see below |
-| `STRATA_NH_TRACE=<file>` (environment) | - | writes each request's prompt ids and generated ids as one JSON line (debugging) |
+| `KRAIT_TRACE=<file>` (environment) | - | writes each request's prompt ids and generated ids as one JSON line (debugging) |
 
 ### `--prefix-reuse`
 
@@ -111,13 +114,13 @@ The chat template writes `<image>` for a picture. For this model the server turn
 encoder's rows as input embeddings in their place. There is no M-RoPE: one position per row. Example: a 640x480 picture
 becomes 300 rows.
 
-## Docker Compose (Strata + Open WebUI + embedder for RAG)
+## Docker Compose (Krait + Open WebUI + embedder for RAG)
 
-`docker/nemotron/`: `stage.sh` builds a runtime image (`strata-nemotron:local`) from your build, and `compose.yml`
-starts Strata (GPU), Open WebUI and a llama.cpp embedding server (CPU, nomic-embed-text-v1.5) that Open WebUI uses
-for document search. Steps: `cp docker/nemotron/env.example docker/nemotron/.env` (set NH_MODELS and the keys), run
-`docker/nemotron/stage.sh`, then `docker compose -f docker/nemotron/compose.yml --env-file docker/nemotron/.env up -d`,
-then open http://127.0.0.1:3095. `docker/nemotron/smoke_openwebui.py` checks the stack through Open WebUI's API: chat,
+`docker/krait/`: `stage.sh` builds a runtime image (`krait:local`) from your build, and `compose.yml`
+starts Krait (GPU), Open WebUI and a llama.cpp embedding server (CPU, nomic-embed-text-v1.5) that Open WebUI uses
+for document search. Steps: `cp docker/krait/env.example docker/krait/.env` (set KRAIT_MODELS and the keys), run
+`docker/krait/stage.sh`, then `docker compose -f docker/krait/compose.yml --env-file docker/krait/.env up -d`,
+then open http://127.0.0.1:3095. `docker/krait/smoke_openwebui.py` checks the stack through Open WebUI's API: chat,
 streaming, a picture, and a document upload -> embedding -> retrieval -> answer round trip. It passed 8/8 on the test machine with
 Docker Engine 29.8.1 in WSL2.
 
@@ -126,11 +129,23 @@ Docker Engine 29.8.1 in WSL2.
 Model-free (CTest, `-DSTRATA_BUILD_TESTS=ON`; also part of the full `ctest`):
 
 - `nemotron_h_layout_test`: geometry from metadata, block kinds, the layout check and its refusals, GGUF arrays, family name.
-- `nh_layout_cli_*`, `nh_engine_cli_*`: exit codes of `strata-nh-layout` and `strata-nh-engine` on tiny synthetic files (the engine refuses a broken layout with exit 3 before it touches the GPU).
+- `nh_layout_cli_*`, `nh_engine_cli_*`: exit codes of `krait-layout` and `krait-engine` on tiny synthetic files (the engine refuses a broken layout with exit 3 before it touches the GPU).
 - `nemotron_serve_test`: serve/test_nemotron_frontend.py and serve/test_nemotron_vision.py (effort mapping, sampling card, picture expansion, encoder flags).
 
-With the model: `strata-nh-vecdot-test --model <shard>` (the CPU-exact expert kernels vs ggml-cpu, bit for bit) and
-`nemotron/bench_serve.py` (HTTP benchmark).
+With the model: `krait-vecdot-test --model <shard>` (the CPU-exact expert kernels vs ggml-cpu, bit for bit) and
+`krait/bench_serve.py` (HTTP benchmark).
+
+## Names
+
+Krait's names live in `krait/project.env`: PROJECT_NAME (Krait), PROJECT_SLUG (krait: image tag, compose project),
+ENGINE_BIN (krait-engine), LAYOUT_BIN (krait-layout), VECDOT_BIN (krait-vecdot-test), VISION_BIN (krait-vision, upstream
+Strata's strata-vision target installed under this name). CMakeLists.txt (target names; the binaries print the name
+they are built with), krait/build.sh, krait/krait and docker/krait/stage.sh read it. Plain text that names them too:
+this file, README.md, THIRD_PARTY_NOTICES.md, docker/krait/compose.yml and krait/config.json (`exe`). Environment:
+`KRAIT_ROOT`, `KRAIT_PYTHON`, `KRAIT_CONFIG`, `KRAIT_API_KEY` (krait/krait passes it on as `STRATA_API_KEY`, the
+variable the upstream server reads), `KRAIT_TRACE`, and in compose `KRAIT_MODELS`, `KRAIT_IMAGE`, `KRAIT_PORT`. The
+upstream code keeps its own names (serve/, strata_cli, strata_control, the C++ namespace `strata`, `STRATA_*` build
+options).
 
 ## Limits
 

@@ -64,8 +64,8 @@ inline std::string model_family_not_supported(ModelFamily f) {
     if (model_family_runs(f)) return {};
     if (f == ModelFamily::Unknown) return "this is not a model family Strata knows";
     if (f == ModelFamily::NemotronHMoe)
-        return "Nemotron 3.5 Super (architecture 'nemotron_h_moe') runs on its own engine, strata-nh-engine "
-               "(nemotron/run-nemotron.sh, docs/NEMOTRON.md), not on this one";
+        return "Nemotron 3.5 Super (architecture 'nemotron_h_moe') runs on Krait, its own engine "
+               "(krait/build.sh and krait/krait, docs/KRAIT.md), not on this one";
     return std::string(model_family_title(f)) + " (architecture '" + model_family_arch(f) +
            "') runs on the NVIDIA (CUDA) and AMD (HIP) builds of Strata; this build does not run it yet (the Intel "
            "Arc / SYCL port is in development). Use a CUDA or HIP build, or a Qwen3.8-Flash-Next model file";

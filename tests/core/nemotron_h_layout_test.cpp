@@ -277,8 +277,8 @@ int main(int argc, char** argv) {
         check(f == ModelFamily::NemotronHMoe && std::string(strata::model_family_arch(f)) == "nemotron_h_moe" &&
                   std::string(strata::model_family_title(f)) == "Nemotron 3.5 Super",
               "nemotron_h_moe -> NemotronHMoe, title Nemotron 3.5 Super");
-        check(strata::model_family_not_supported(f).find("strata-nh-engine") != std::string::npos,
-              "the strata engine's refusal points to strata-nh-engine");
+        check(strata::model_family_not_supported(f).find("krait/krait") != std::string::npos,
+              "the strata engine's refusal points to Krait (krait/krait)");
     }
 
     std::printf("%s\n", g_fail ? "FAILED" : "all passed");
