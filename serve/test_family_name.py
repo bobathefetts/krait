@@ -1,5 +1,6 @@
 """serve/test_family_name.py - the API's model name per model family (NEW-MODELS-PLAN.md T0): the config's
-"model_name" wins; without one, the family's ("arch": qwen4exp -> qwen3.8-flash-next, qwen35moe -> qwen3.6-35b-a3b),
+"model_name" wins; without one, the family's ("arch": qwen4exp -> qwen3.8-flash-next, qwen35moe -> qwen3.6-35b-a3b,
+nemotron_h_moe -> nemotron-3.5-super-120b-a12b),
 and Flash-Next's for a config that names neither (every config setup wrote before).
 
     python -m unittest serve.test_family_name
@@ -19,11 +20,12 @@ class FamilyName(unittest.TestCase):
     def test_per_family(self):
         self.assertEqual(default_model_name({"arch": "qwen35moe"}), "qwen3.6-35b-a3b")
         self.assertEqual(default_model_name({"arch": "qwen4exp"}), "qwen3.8-flash-next")
+        self.assertEqual(default_model_name({"arch": "nemotron_h_moe"}), "nemotron-3.5-super-120b-a12b")
 
     def test_old_configs(self):
         self.assertEqual(default_model_name({}), "qwen3.8-flash-next")
         self.assertEqual(default_model_name({"arch": "something-else"}), "qwen3.8-flash-next")
-        self.assertEqual(set(FAMILY_MODEL_NAMES), {"qwen4exp", "qwen35moe"})
+        self.assertEqual(set(FAMILY_MODEL_NAMES), {"qwen4exp", "qwen35moe", "nemotron_h_moe"})
 
 
 if __name__ == "__main__":

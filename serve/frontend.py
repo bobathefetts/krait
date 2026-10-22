@@ -62,6 +62,11 @@ class ChatTemplate:
                     if i == len(messages) - 1 or os.environ.get("STRATA_KEEP_EMPTY_TURNS") == "1" or not (isinstance(m, dict) and m.get("role") == "assistant"
                                                       and not _text_of(m.get("content")).strip()
                                                       and not _has_image(m.get("content")) and not m.get("tool_calls"))]
+        # Nemotron 3.5 Super's template has no reasoning_effort: its levels are full thinking, medium_effort (the
+        # "{reasoning effort: efficient}" suffix) and enable_thinking=false.  low / medium map onto medium_effort.
+        if "medium_effort" in self.source and kwargs.get("reasoning_effort") in ("low", "medium") \
+                and "medium_effort" not in kwargs:
+            kwargs["medium_effort"] = True
         return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
                                     **kwargs)
 

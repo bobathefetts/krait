@@ -3768,8 +3768,13 @@ class Service:
         self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
         self.images = None                                # serve/images.py's ImageGen when the config has "images"
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
-        self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
-                            tokenizer.encode("<|endoftext|>", parse_special=True))
+        # the end-of-turn tokens: only a text that IS one token of this vocabulary (Nemotron's has no <|endoftext|>:
+        # it would encode to ordinary pieces such as "<", "|" and end every answer at its first "|")
+        def one_token(text):
+            ids = tokenizer.encode(text, parse_special=True)
+            return ids if len(ids) == 1 else []
+        self.stop_ids = set(one_token(IM_END) + one_token("<|endoftext|>") +
+                            (one_token("</s>") if "</s>" in getattr(tokenizer, "control_tokens", ()) else []))
         # #567: a prompt re-encodes only what follows the last special token it shares with a recent prompt (the
         # same ids as a full encode: tools/strata_tokenizer.py PromptEncoder).  Tokenizers without resume points
         # encode in full.
@@ -7830,7 +7835,8 @@ def check_request_sampling(req) -> None:
 
 
 # the API's model name per model family (the GGUF architecture, "arch" in the config) when the config names none
-FAMILY_MODEL_NAMES = {"qwen4exp": "qwen3.8-flash-next", "qwen35moe": "qwen3.6-35b-a3b"}
+FAMILY_MODEL_NAMES = {"qwen4exp": "qwen3.8-flash-next", "qwen35moe": "qwen3.6-35b-a3b",
+                      "nemotron_h_moe": "nemotron-3.5-super-120b-a12b"}
 
 
 # The sampling each model card recommends ("Best Practices"), used when neither the request, the Chat settings nor the
@@ -7843,6 +7849,10 @@ MODEL_CARD_SAMPLING = {
     # Qwen3.6-35B-A3B: the general-task sets (the card's precise-coding set is temperature 0.6, presence_penalty 0)
     "qwen35moe": {"thinking": {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "presence_penalty": 1.5},
                   "instruct": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5}},
+    # Nemotron 3.5 Super (nemotron_h_moe): NVIDIA's card, "temperature=1.0 and top_p=0.95 across all tasks" (reasoning,
+    # tool calling, chat); no top-k (0: the engine's widest list)
+    "nemotron_h_moe": {"thinking": {"temperature": 1.0, "top_p": 0.95, "top_k": 0},
+                       "instruct": {"temperature": 1.0, "top_p": 0.95, "top_k": 0}},
 }
 
 
@@ -8103,7 +8113,13 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             tokens[i] = t
         merges = (tpath / "merges.txt").read_text(encoding="utf-8").split("\n")
         types = json.loads((tpath / "token_type.json").read_text())
-        tok = ST.Tokenizer(tokens, merges, types)
+        # the pre-tokenizer the pack names (tools/strata_tokenizer.py extract(): "pre", e.g. tekken for Nemotron 3.5
+        # Super); a pack without tokenizer.json keeps qwen35, as before
+        try:
+            pre = json.loads((tpath / "tokenizer.json").read_text(encoding="utf-8")).get("pre") or "qwen35"
+        except (OSError, ValueError):
+            pre = "qwen35"
+        tok = ST.Tokenizer(tokens, merges, types, pre=pre)
     hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here
     if a.offline and (hub is not None or cfg.get("before_load") or a.before_load):
         ap.error("--offline requires MCP servers and before_load commands to be disabled in this profile")

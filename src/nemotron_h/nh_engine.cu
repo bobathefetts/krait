@@ -2286,6 +2286,7 @@ struct Serve {
         Sampling smp;
         std::mt19937_64 rng;
         std::vector<int32_t> hist;
+        size_t n_prompt = 0;
         double t0 = 0;
     };
     struct Sess {
@@ -2301,10 +2302,26 @@ struct Serve {
     long long windows = 0, window_rows = 0;
     double window_s = 0;
     int read_windows = 1;
+    FILE* trace = nullptr;
+    bool prefix_reuse = true;   // --prefix-reuse on|off   // STRATA_NH_TRACE=<file>: one JSON line per finished request (prompt ids, generated ids)
 
     Serve(Engine& e, const SpecCfg& sc, int ch, const std::set<int>& eg)
         : E(e), spec(sc), chunk(ch), eog(eg), nv(e.W.g.n_vocab), slots((size_t) e.M.n_slots), sess((size_t) e.M.n_slots) {
         if (const char* v = std::getenv("STRATA_NH_READ_WINDOWS")) read_windows = std::max(0, std::min(64, std::atoi(v)));
+        if (const char* v = std::getenv("STRATA_NH_TRACE"))
+            if (*v && !(trace = std::fopen(v, "a"))) std::fprintf(stderr, "[nh_serve] cannot open the trace file %s\n", v);
+    }
+    ~Serve() {
+        if (trace) std::fclose(trace);
+    }
+    void trace_req(const char* mode, int slot, const int32_t* p, size_t np, const int32_t* o, size_t no, const char* fin) {
+        if (!trace) return;
+        std::fprintf(trace, "{\"mode\": \"%s\", \"slot\": %d, \"finish\": \"%s\", \"prompt\": [", mode, slot, fin);
+        for (size_t i = 0; i < np; ++i) std::fprintf(trace, "%s%d", i ? ", " : "", p[i]);
+        std::fprintf(trace, "], \"out\": [");
+        for (size_t i = 0; i < no; ++i) std::fprintf(trace, "%s%d", i ? ", " : "", o[i]);
+        std::fprintf(trace, "]}\n");
+        std::fflush(trace);
     }
     bool is_eos(int t) const { return eog.count(t) > 0; }
     static double ms_since(double t0) { return (now_s() - t0) * 1e3; }
@@ -2361,6 +2378,7 @@ struct Serve {
                               : E.M.n_past[(size_t) b] + 1 > E.M.n_ctx ? "length" : nullptr;
             if (fin) {
                 std::printf("BDONE %d %lld %s %.1f\n", b, (long long) st.produced, fin, ms_since(st.t0));
+                trace_req("batch", b, st.hist.data(), st.n_prompt, st.hist.data() + st.n_prompt, st.hist.size() - st.n_prompt, fin);
                 st.active = false;
                 ss.active = false;
                 --n_active;
@@ -2373,7 +2391,7 @@ struct Serve {
 
     size_t match_len(const Sess& ss, const std::vector<int32_t>& ids) const {
         const size_t L = ss.live.size();
-        if (L == 0 || L >= ids.size() || !std::equal(ss.live.begin(), ss.live.end(), ids.begin())) return 0;
+        if (!prefix_reuse || L == 0 || L >= ids.size() || !std::equal(ss.live.begin(), ss.live.end(), ids.begin())) return 0;
         return L;
     }
 
@@ -2511,6 +2529,7 @@ struct Serve {
             const char* fin = is_eos(nx) ? "stop" : stop.load() ? "cancel" : max_new <= 1 ? "length"
                               : E.M.n_past[(size_t) s] + 1 > E.M.n_ctx ? "length" : nullptr;
             const bool cont = fin == nullptr;
+            if (!cont) trace_req("batch", slot, ids.data(), ids.size(), &nx, 1, fin);
             std::printf("DONE 1 %zu %.1f %.1f %s 0 0 %zu 0 0 0 0 0.0 %lld 0\n", ids.size(), prompt_ms, ms_since(d0),
                         cont ? "length" : fin, reuse, (long long) fresh);
             if (cont) {
@@ -2523,6 +2542,7 @@ struct Serve {
                 st.smp = smp;
                 st.rng = rng;
                 st.hist = hist;
+                st.n_prompt = ids.size();
                 st.t0 = now_s();
                 ss.active = true;
                 ++n_active;
@@ -2584,6 +2604,7 @@ struct Serve {
             ss.live = std::move(all);
         }
         const double decode_ms = ms_since(d0);
+        trace_req("solo", s, ids.data(), ids.size(), out.data(), out.size(), finish);
         std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu 0 0 0 0 0.0 %lld 0\n", produced, ids.size(), prompt_ms, decode_ms,
                     finish, accepted, offered, reuse, (long long) fresh);
         std::fflush(stdout);
@@ -2597,6 +2618,7 @@ struct Serve {
         std::printf("INFO engine=strata-nh-engine arch=nemotron_h_moe kv_slots=%d spec=%d expert_cache_mib=%.0f\n", n_sess(), spec.mode,
                     E.C.pool_bytes / 1048576.0);
         if (n_sess() > 1) std::printf("INFO batch_slots=%d slot_cache=1\n", n_sess());
+        std::fprintf(stderr, "[nh_serve] prefix reuse %s\n", prefix_reuse ? "on" : "off (every prompt is read from position 0, as the CLI does)");
         std::printf("READY %d stop\n", E.M.n_ctx);
         std::fflush(stdout);
         std::thread reader([&] {
@@ -2670,6 +2692,7 @@ int real_main(int argc, char** argv) {
     int mtp_topk = 0;
     int K = 32, chunk = 512, ctx = 32768, threads = 16, n_cpu_moe = 68;
     bool serve_mode = false;
+    bool prefix_reuse = true;
     int batch = 0;
     for (int i = 1; i < argc; ++i)
         if (std::string(argv[i]) == "--serve") serve_mode = true;
@@ -2682,6 +2705,11 @@ int real_main(int argc, char** argv) {
         if (a == "--model" || a == "--native") model = nx();
         else if (a == "--serve") serve_mode = true;
         else if (a == "--batch" || a == "--slots") batch = std::stoi(nx());
+        else if (a == "--prefix-reuse") {
+            const std::string v = nx();
+            if (v != "on" && v != "off") throw std::runtime_error("--prefix-reuse takes on or off");
+            prefix_reuse = v == "on";
+        }
         else if (a == "--max-context") ctx = std::stoi(nx());
         else if (a == "--list") list = nx();
         else if (a == "--tokdir") tokdir = nx();
@@ -2786,6 +2814,7 @@ int real_main(int argc, char** argv) {
     const std::set<int> eog = {11, 2};   // llama-vocab.cpp:3172-3202 (<|im_end|>, </s>), :3233 (eos)
     if (serve_mode) {
         Serve sv(E, spec, chunk, eog);
+        sv.prefix_reuse = prefix_reuse;
         return sv.run();
     }
     if (!bench.empty()) {
