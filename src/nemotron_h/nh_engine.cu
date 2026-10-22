@@ -383,6 +383,7 @@ struct SlotPool {
     std::vector<int> slot_of, exp_of;
     std::vector<cudaEvent_t> ready;    // lo: async upload done
     std::vector<uint8_t> pending;
+    std::vector<int> pend_list;   // slots with an admission upload issued and not yet seen complete (review H2)
     std::vector<double> score;         // LFU with decay: score at step last[e]
     std::vector<int64_t> last;
     long hits = 0, misses = 0, uploads = 0, upload_skips = 0;
@@ -554,6 +555,18 @@ void op_up_lo(ggml_tensor* dst, int ith, int nth, void* ud) {
 
 void admit_lo(CacheCtx& C, SlotPool& p, const ggml_tensor* sel, const int32_t* pi) {
     const int n_miss = pi[0], n_hit = pi[1], T = pi[2];
+    // review H2: clear finished uploads here too, not only when the expert is selected again (else such slots can
+    // never be victims and the pool freezes).  Only the few slots uploaded recently are queried.
+    for (size_t i = 0; i < p.pend_list.size();) {
+        const int s = p.pend_list[i];
+        if (!p.pending[(size_t) s] || cudaEventQuery(p.ready[(size_t) s]) == cudaSuccess) {
+            p.pending[(size_t) s] = 0;
+            p.pend_list[i] = p.pend_list.back();
+            p.pend_list.pop_back();
+        } else {
+            ++i;
+        }
+    }
     std::vector<uint8_t> in_use((size_t) p.cap, 0);
     for (int h = 0; h < n_hit; ++h) in_use[(size_t) pi[3 + 2 * NU_MAX + h]] = 1;
     for (int k = 0; k < C.n_used * T; ++k) touch(p, sel_at(sel, k, C.n_used), C.step, C.decay);
@@ -595,6 +608,7 @@ void admit_lo(CacheCtx& C, SlotPool& p, const ggml_tensor* sel, const int32_t* p
                         cudaMemcpyHostToDevice, C.s_copy);
         cudaEventRecord(p.ready[(size_t) victim], C.s_copy);
         p.pending[(size_t) victim] = 1;
+        p.pend_list.push_back(victim);
         in_use[(size_t) victim] = 1;
         p.uploads++;
         admitted++;
