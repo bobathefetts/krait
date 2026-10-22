@@ -759,6 +759,21 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_executable(strata-nhref src/nemotron_h/nhref.cu)
   target_include_directories(strata-nhref PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
   target_link_libraries(strata-nhref PRIVATE strata_warnings ${_strata_gpu_runtime_target} ${_strata_gpu_blas_target})
+  # the Phase 2 engine for the same family (src/nemotron_h/nh_engine.cu): llama.cpp's ggml kernels (ggml-cuda +
+  # ggml-cpu, a SEPARATE shared build of the reference sources: STRATA_NH_GGML_INCLUDE = <llama.cpp>/ggml/include,
+  # STRATA_NH_GGML_LIBDIR = that build's bin/) on a graph and scheduler Strata builds, so Gate 2 can hold it to
+  # llama.cpp's numerics.  Only configured when both paths are given.
+  set(STRATA_NH_GGML_INCLUDE "" CACHE PATH "ggml/include of the llama.cpp sources strata-nh-engine runs on")
+  set(STRATA_NH_GGML_LIBDIR "" CACHE PATH "directory with libggml*.so (CUDA + CPU) built from those sources")
+  if(STRATA_NH_GGML_INCLUDE AND STRATA_NH_GGML_LIBDIR)
+    add_executable(strata-nh-engine src/nemotron_h/nh_engine.cu)
+    target_include_directories(strata-nh-engine BEFORE PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_include_directories(strata-nh-engine SYSTEM BEFORE PRIVATE ${STRATA_NH_GGML_INCLUDE})
+    target_link_libraries(strata-nh-engine PRIVATE strata_warnings
+      ${STRATA_NH_GGML_LIBDIR}/libggml.so ${STRATA_NH_GGML_LIBDIR}/libggml-base.so
+      ${STRATA_NH_GGML_LIBDIR}/libggml-cpu.so ${STRATA_NH_GGML_LIBDIR}/libggml-cuda.so)
+    set_target_properties(strata-nh-engine PROPERTIES CUDA_RUNTIME_LIBRARY Shared BUILD_RPATH ${STRATA_NH_GGML_LIBDIR})
+  endif()
   # the engine path for the same family (serve protocol, prompt chunks, decode graph): src/qwen35/q36_engine.cu, a
   # library that `strata` switches to for a qwen35moe model (the family switch at the top of its main) and that
   # strata-q36 wraps on its own.  Not on gfx906 (#3172, #3271): it calls cuBLAS entry points the wave64 compat layer does
