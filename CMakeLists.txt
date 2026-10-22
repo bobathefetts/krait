@@ -306,7 +306,7 @@ if(STRATA_BUILD_TESTS)
   find_package(Python3 COMPONENTS Interpreter)
   if(Python3_Interpreter_FOUND)
     add_test(NAME nemotron_serve_test
-      COMMAND ${Python3_EXECUTABLE} -m unittest -v serve.test_nemotron_frontend serve.test_nemotron_vision
+      COMMAND ${Python3_EXECUTABLE} -m unittest -v serve.test_nemotron_frontend serve.test_nemotron_vision serve.test_krait_launch
       WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
   endif()
   # how --batch cuts a prompt read into pieces (a layer split with no slot decoding must still reach a BYIELD)
