@@ -46,6 +46,8 @@
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <map>
+#include <cctype>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -301,6 +303,35 @@ bool dump_cb(ggml_tensor* t, bool ask, void* ud) {
     return true;
 }
 
+// ---- --profile: every node computed on its own (sched eval callback asks for all), wall time per node aggregated by
+// (backend, op, role); used to see where a decode step goes, never for timing runs ----
+struct ProfCtx {
+    bool on = false;
+    ggml_backend_sched_t sched = nullptr;
+    double t_last = 0;
+    std::map<std::string, std::pair<double, long>> agg;
+};
+
+std::string prof_role(const char* name) {
+    std::string n(name);
+    const size_t d = n.rfind('-');
+    if (d != std::string::npos && d + 1 < n.size() && std::isdigit((unsigned char) n[d + 1])) n = n.substr(0, d);
+    return n;
+}
+
+bool prof_cb(ggml_tensor* t, bool ask, void* ud) {
+    ProfCtx& p = *static_cast<ProfCtx*>(ud);
+    if (ask) return true;
+    const double t1 = now_s();
+    ggml_backend_t b = ggml_backend_sched_get_tensor_backend(p.sched, t);
+    const std::string key = std::string(b ? ggml_backend_name(b) : "?") + "\t" + ggml_op_desc(t) + "\t" + prof_role(t->name);
+    auto& e = p.agg[key];
+    e.first += t1 - p.t_last;
+    e.second += 1;
+    p.t_last = now_s();
+    return true;
+}
+
 struct Engine {
     Weights W;
     Memory M;
@@ -308,6 +339,7 @@ struct Engine {
     ggml_backend_sched_t sched = nullptr;
     CopyExperts cx;
     DumpCtx dump;
+    ProfCtx prof;
     int n_threads = 16;
     bool force_norm = true;   // llama-context.cpp graph_get_cb: "norm" pinned to the layer's device (full offload)
     int max_nodes = 16384;
@@ -678,7 +710,12 @@ struct Engine {
         const int64_t rs_zero = pos0 == 0 ? slot : -1;
         GraphIn gi;
         ggml_backend_sched_reset(sched);
-        ggml_backend_sched_set_eval_callback(sched, dump.f ? dump_cb : nullptr, &dump);
+        if (prof.on) {
+            prof.sched = sched;
+            ggml_backend_sched_set_eval_callback(sched, prof_cb, &prof);
+        } else {
+            ggml_backend_sched_set_eval_callback(sched, dump.f ? dump_cb : nullptr, &dump);
+        }
         build_graph(T, slot, pos0, n_kv, n_out, rs_zero, gi);
         if (!ggml_backend_sched_alloc_graph(sched, gf)) throw std::runtime_error("nh_engine: graph alloc failed");
         ggml_backend_tensor_set(gi.tokens, tok, 0, (size_t) T * 4);
@@ -705,6 +742,7 @@ struct Engine {
         }
         cx.reset();
         ggml_backend_cpu_set_n_threads(cpu, n_threads);
+        if (prof.on) prof.t_last = now_s();
         if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS)
             throw std::runtime_error("nh_engine: graph compute failed");
         const size_t nv = (size_t) gi.logits->ne[0];
@@ -728,7 +766,8 @@ std::set<std::string> split_ids(const std::string& s) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::string model, list, tokdir, outdir, force, only, dump_sums, dump_prompt;
+    std::string model, list, tokdir, outdir, force, only, dump_sums, dump_prompt, bench, bench_out;
+    int profile = 0;
     int K = 32, chunk = 512, ctx = 32768, threads = 16, n_cpu_moe = 68;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -749,15 +788,19 @@ int main(int argc, char** argv) {
         else if (a == "--only") only = nx();
         else if (a == "--dump-sums") dump_sums = nx();
         else if (a == "--dump-prompt") dump_prompt = nx();
+        else if (a == "--bench") bench = nx();
+        else if (a == "--bench-out") bench_out = nx();
+        else if (a == "--profile") profile = std::stoi(nx());
         else {
             std::fprintf(stderr, "unknown argument %s\n", a.c_str());
             return 2;
         }
     }
-    if (model.empty() || list.empty() || tokdir.empty() || outdir.empty()) {
+    if (model.empty() || ((list.empty() || tokdir.empty() || outdir.empty()) && bench.empty())) {
         std::fprintf(stderr, "usage: strata-nh-engine --model SHARD --list LIST --tokdir DIR --out RAWDIR [--k 32] "
                              "[--chunk 512] [--ctx 32768] [--threads 16] [--n-cpu-moe 68] [--force RAWDIR] [--only ids] "
-                             "[--dump-sums FILE --dump-prompt ID]\n");
+                             "[--dump-sums FILE --dump-prompt ID]\n       strata-nh-engine --model SHARD --bench FILE --bench-out JSONL "
+                             "[--profile NTOK] [--chunk 512] [--ctx 32768] [--threads 16] [--n-cpu-moe 68]\n");
         return 2;
     }
     const std::set<std::string> only_ids = split_ids(only);
@@ -776,6 +819,62 @@ int main(int argc, char** argv) {
     }
     const int nv = m.g.n_vocab;
     const std::set<int> eog = {11, 2};   // llama-vocab.cpp:3172-3202 (<|im_end|>, </s>), :3233 (eos)
+    if (!bench.empty()) {
+        // Gate 3 bench: each line "name n_predict ignore_eos reps n_tok tok...". Timing as llama-server
+        // (server-common.h:405-480): prompt time = start -> first token sampled; decode tok/s = (n_gen - 1) / (t_last_token
+        // - t_first_token); prefill in ubatches of --chunk with logits for the last token only.
+        std::ifstream bf(bench);
+        FILE* bo = std::fopen(bench_out.c_str(), "w");
+        if (!bf || !bo) throw std::runtime_error("cannot open bench files");
+        std::string name;
+        int npred, igeos, reps, ntok;
+        while (bf >> name >> npred >> igeos >> reps >> ntok) {
+            std::vector<int32_t> pt((size_t) ntok);
+            for (int i = 0; i < ntok; ++i) bf >> pt[(size_t) i];
+            for (int rep = 0; rep < reps; ++rep) {
+                E.clear_slot(0);
+                const double t0 = now_s();
+                for (int off = 0; off < ntok; off += chunk) E.decode(pt.data() + off, std::min(chunk, ntok - off), 0, false);
+                std::vector<int32_t> out{argmax(E.logits.data(), nv)};
+                const double t1 = now_s();
+                double t2 = t1;
+                const bool prof_run = profile > 0 && rep == 0;
+                while ((int) out.size() < npred && (igeos || !eog.count(out.back()))) {
+                    if (prof_run && (int) out.size() == 4) E.prof.on = true;
+                    E.decode(&out.back(), 1, 0, false);
+                    out.push_back(argmax(E.logits.data(), nv));
+                    t2 = now_s();
+                    if (prof_run && (int) out.size() == 4 + profile) break;
+                }
+                if (prof_run) {
+                    E.prof.on = false;
+                    std::vector<std::pair<double, std::string>> v;
+                    double tot = 0;
+                    for (auto& kv : E.prof.agg) {
+                        v.push_back({kv.second.first, kv.first + "\t" + std::to_string(kv.second.second)});
+                        tot += kv.second.first;
+                    }
+                    std::sort(v.rbegin(), v.rend());
+                    std::fprintf(stderr, "[profile] %s: %d tokens, %.3f ms/token in callbacks\n", name.c_str(), profile, tot * 1e3 / profile);
+                    for (auto& x : v) std::fprintf(stderr, "[profile] %9.3f ms/tok\t%s\n", x.first * 1e3 / profile, x.second.c_str());
+                    E.prof.agg.clear();
+                    continue;
+                }
+                const int ng = (int) out.size();
+                const double pms = (t1 - t0) * 1e3, gms = (t2 - t1) * 1e3;
+                std::fprintf(bo, "{\"name\": \"%s\", \"rep\": %d, \"prompt_n\": %d, \"prompt_ms\": %.3f, \"pp_tok_s\": %.4f, "
+                                 "\"predicted_n\": %d, \"predicted_ms\": %.3f, \"decode_tok_s\": %.4f, \"ttft_s\": %.4f, \"tokens\": [",
+                             name.c_str(), rep, ntok, pms, ntok / (t1 - t0), ng, gms, ng > 1 ? (ng - 1) / (t2 - t1) : 0.0, t1 - t0);
+                for (int i = 0; i < ng; ++i) std::fprintf(bo, "%s%d", i ? ", " : "", out[(size_t) i]);
+                std::fprintf(bo, "]}\n");
+                std::fflush(bo);
+                std::fprintf(stderr, "[bench] %s rep %d prompt_n=%d pp=%.2f tok/s ttft=%.3f s gen=%d decode=%.3f tok/s\n",
+                             name.c_str(), rep, ntok, ntok / (t1 - t0), t1 - t0, ng, ng > 1 ? (ng - 1) / (t2 - t1) : 0.0);
+            }
+        }
+        std::fclose(bo);
+        return 0;
+    }
     FILE* sumf = std::fopen((outdir + "/capture_log.txt").c_str(), "w");
     if (!sumf) throw std::runtime_error("cannot write " + outdir + "/capture_log.txt");
     std::fprintf(sumf, "engine=strata-nh-engine n_vocab=%d n_ctx=%d K=%d chunk=%d force=%s n_cpu_moe=%d threads=%d\n", nv,

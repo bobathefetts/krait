@@ -773,6 +773,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       ${STRATA_NH_GGML_LIBDIR}/libggml.so ${STRATA_NH_GGML_LIBDIR}/libggml-base.so
       ${STRATA_NH_GGML_LIBDIR}/libggml-cpu.so ${STRATA_NH_GGML_LIBDIR}/libggml-cuda.so)
     set_target_properties(strata-nh-engine PROPERTIES CUDA_RUNTIME_LIBRARY Shared BUILD_RPATH ${STRATA_NH_GGML_LIBDIR})
+    # bit-exactness test of the CPU-exact expert kernels (nh_cpuexact.cuh) against ggml-cpu
+    add_executable(strata-nh-vecdot-test src/nemotron_h/nh_vecdot_test.cu)
+    target_include_directories(strata-nh-vecdot-test BEFORE PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_include_directories(strata-nh-vecdot-test SYSTEM BEFORE PRIVATE ${STRATA_NH_GGML_INCLUDE})
+    target_link_libraries(strata-nh-vecdot-test PRIVATE strata_warnings
+      ${STRATA_NH_GGML_LIBDIR}/libggml.so ${STRATA_NH_GGML_LIBDIR}/libggml-base.so ${STRATA_NH_GGML_LIBDIR}/libggml-cpu.so)
+    set_target_properties(strata-nh-vecdot-test PROPERTIES CUDA_RUNTIME_LIBRARY Shared BUILD_RPATH ${STRATA_NH_GGML_LIBDIR})
   endif()
   # the engine path for the same family (serve protocol, prompt chunks, decode graph): src/qwen35/q36_engine.cu, a
   # library that `strata` switches to for a qwen35moe model (the family switch at the top of its main) and that
