@@ -2,7 +2,9 @@
   <img src="docs/assets/banner.jpg" alt="Krait: fast local inference for NVIDIA Nemotron 3.5 Super" width="100%">
 </p>
 
-<h3 align="center">Run Nemotron 3.5 Super 120B locally on one 32 GB GPU: 1.6x llama.cpp's decode speed (greedy), bit-exact.</h3>
+<h1 align="center">Krait: fast local inference for NVIDIA Nemotron 3.5 Super</h1>
+
+<p align="center"><b>Run Nemotron 3.5 Super 120B locally on one 32 GB GPU such as an RTX 5090: 1.6x llama.cpp's decode speed (greedy), bit-exact.</b></p>
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-5cf03a?style=flat-square" alt="License: MIT"></a>
@@ -16,10 +18,17 @@
 Nemotron 3.5 Super.** It keeps Strata's server, API and vision path and adds an engine of its own for Nemotron's hybrid
 Mamba-2 / attention / mixture-of-experts layers.
 
-Krait is a Nemotron 3.5 Super inference engine and server. It runs **NVIDIA Nemotron 3.5 Super VL 120B-A12B** (GGUF architecture `nemotron_h_moe`, Unsloth's UD-Q4_K_XL GGUF)
+Krait is a Nemotron 3.5 Super inference engine with an OpenAI-compatible server, for running the model as a local LLM.
+It runs **NVIDIA Nemotron 3.5 Super VL 120B-A12B** (GGUF architecture `nemotron_h_moe`, Unsloth's UD-Q4_K_XL GGUF)
 on a single 32 GB NVIDIA card such as an RTX 5090, with the routed experts of most layers in host RAM. Its engine,
 `krait-engine`, runs on llama.cpp's ggml kernels (b11806) with its own graph, expert cache, scheduler and MTP
 speculation. It serves text and pictures over the OpenAI and Anthropic APIs, with up to 4 requests at once.
+
+The model goes by several names: NVIDIA publishes it as
+[`nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16),
+and it is often called Nemotron-3.5-Super, Nemotron 3.5 Super 120B or NVIDIA Nemotron Super. Krait runs Unsloth's GGUF
+conversion of that model,
+[`unsloth/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-GGUF`](https://huggingface.co/unsloth/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-GGUF).
 
 ## Why Krait
 
@@ -34,7 +43,7 @@ speculation. It serves text and pictures over the OpenAI and Anthropic APIs, wit
 - **Open WebUI + RAG Docker stack:** Krait, Open WebUI and a local embedding server for document search, in one
   `docker compose up`.
 
-## Benchmarks
+## Benchmarks: Krait vs llama.cpp on an RTX 5090
 
 <p align="center">
   <img src="docs/assets/decode-speed.png" alt="Decode speed: llama.cpp b11806 14.30 tok/s, Krait without speculation 20.68 tok/s, Krait with MTP speculation 23.02 tok/s (greedy)" width="100%">
@@ -61,7 +70,7 @@ speculation. It serves text and pictures over the OpenAI and Anthropic APIs, wit
   real prompts drifts apart after 40 to 197 tokens.
 - Methods, memory figures and every raw number: [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
-## How it works
+## How it works: a Mamba MoE inference engine
 
 ```mermaid
 flowchart LR
@@ -111,7 +120,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 krait/build.sh     # fetches llama.cpp b11806 + the pinned commit; builds krait-engine, krait-layout, krait-vision
                    # (CUDA_ARCH=120 by default; set it for another card - untested)
 
-# the model (not included): Unsloth's NVIDIA-Nemotron-3.5-Super-VL-120B-A12B GGUF
+# the model (not included): huggingface.co/unsloth/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-GGUF, laid out as
 #   $KRAIT_MODELS/UD-Q4_K_XL/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-UD-Q4_K_XL-0000{1,2,3}-of-00003.gguf
 #   $KRAIT_MODELS/mmproj-BF16.gguf
 export KRAIT_MODELS=/path/to/models
@@ -198,6 +207,10 @@ The rest of Strata (its Qwen engine, the app and tools) is still in this reposit
 
 **Is this Strata Nemotron, or a fork of Strata?** Both: it is a fork of Strata v0.2.2 that adds a Nemotron 3.5 Super
 engine. If you searched for "Strata Nemotron", this is it. Strata itself runs Qwen models; Krait runs Nemotron.
+
+**Does it run other Nemotron models (Nemotron 3 Super, Nemotron 3.5 Lightning, Nano)?** Krait was built and tested
+only for Nemotron 3.5 Super VL 120B-A12B (UD-Q4_K_XL). Other Nemotron models and other quantizations are untested;
+`krait-layout` checks a GGUF's tensors before the engine uses it.
 
 **Can I run Nemotron 120B locally?** Yes, on one 32 GB NVIDIA GPU with enough host RAM for the engine (measured
 resident set 81.3-81.8 GiB; tested with 116,713 MiB visible to Linux). Smaller cards and less RAM are untested.
