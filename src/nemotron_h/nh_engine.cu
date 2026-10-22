@@ -284,6 +284,7 @@ struct Memory {
 struct GraphIn {
     ggml_tensor *tokens = nullptr, *s_copy = nullptr, *s_copy_main = nullptr, *s_copy_tail = nullptr;
     ggml_tensor *k_idxs = nullptr, *v_idxs = nullptr, *kq_mask = nullptr, *out_ids = nullptr, *logits = nullptr;
+    ggml_tensor* h = nullptr;   // result_norm rows (the MTP head's input), when requested
 };
 
 struct DumpCtx {
@@ -353,7 +354,7 @@ struct CacheCtx {
     cudaStream_t s_hit = nullptr, s_copy = nullptr, s_hi = nullptr;
     cudaEvent_t ev_hit = nullptr;
     // device scratch for the hit kernels (one layer at a time)
-    uint8_t* d_args = nullptr;         // [up ptrs | dn ptrs | xi | col] for <= 22 items
+    uint8_t* d_args = nullptr;         // [up ptrs | dn ptrs | xi | col] for <= NU_MAX items
     uint8_t* d_q8k = nullptr;
     float* d_upo = nullptr;
     uint8_t* d_hq = nullptr;
@@ -377,31 +378,44 @@ void touch(SlotPool& p, int e, int64_t step, double decay) {
     p.last[(size_t) e] = step;
 }
 
-// plan layout (I8 tensor, bytes): int32 n_miss, n_hit, miss_k[22], hit_k[22], hit_slot[22], then q8_K of the latent
-constexpr size_t PLAN_Q8K_OFF = 4 * (2 + 3 * 22);
-constexpr size_t PLAN_BYTES = PLAN_Q8K_OFF + 4 * nhx::Q8K_BYTES;
+// Up to NH_TMAX tokens per cached step: T == 1 (decode) and the speculative verify batches (T <= NH_TMAX), where every
+// token's experts are computed exactly as a T == 1 step computes them (per token q8_K, per token vec_dot).
+constexpr int NH_TMAX = 4;
+constexpr int NU_MAX = 22 * NH_TMAX;
+// plan layout (I8 tensor, bytes): int32 n_miss, n_hit, n_tok, miss_k[NU_MAX], hit_k[NU_MAX], hit_slot[NU_MAX], then the
+// q8_K rows of the T latent columns (item k = t * 22 + j: token t, selection slot j)
+constexpr size_t PLAN_Q8K_OFF = 4 * (3 + 3 * NU_MAX);
+constexpr size_t PLAN_Q8K_ROW = 4 * nhx::Q8K_BYTES;   // n_in = 1024: 4 q8_K blocks per token
+constexpr size_t PLAN_BYTES = PLAN_Q8K_OFF + NH_TMAX * PLAN_Q8K_ROW;
+constexpr size_t ARGS_BYTES = 2 * NU_MAX * sizeof(void*) + 2 * NU_MAX * sizeof(int);
 
 CacheCtx* g_cache = nullptr;
+
+inline int sel_at(const ggml_tensor* sel, int k, int n_used) {
+    const int t = k / n_used, j = k % n_used;
+    return *(const int32_t*) ((const char*) sel->data + (size_t) j * sel->nb[0] + (size_t) t * sel->nb[1]);
+}
 
 void launch_hits(CacheCtx& C, SlotPool& p, int n_hit) {
     const nhx::UpT ut = p.tu == GGML_TYPE_Q4_K ? nhx::UpT::Q4K : p.tu == GGML_TYPE_Q5_K ? nhx::UpT::Q5K : nhx::UpT::Q6K;
     const nhx::DownT dt = p.td == GGML_TYPE_Q5_0 ? nhx::DownT::Q50 : nhx::DownT::IQ4NL;
     const uint8_t* const* wup = (const uint8_t* const*) C.d_args;
-    const uint8_t* const* wdn = wup + 22;
-    const int* col = (const int*) (C.d_args + 2 * 22 * sizeof(void*));
+    const uint8_t* const* wdn = wup + NU_MAX;
+    const int* xi = (const int*) (C.d_args + 2 * NU_MAX * sizeof(void*));
+    const int* col = xi + NU_MAX;
     const int F = C.n_ff, D = C.n_in;
     dim3 gu((unsigned) (F / 32), (unsigned) n_hit), gq((unsigned) ((F / 32 + 7) / 8), (unsigned) n_hit), gd((unsigned) (D / 32), (unsigned) n_hit);
     switch (ut) {
-    case nhx::UpT::Q4K: nhx::k_up<nhx::UpT::Q4K><<<gu, 256, 0, C.s_hit>>>(wup, C.d_q8k, F, D / 256, p.up_row, C.d_upo); break;
-    case nhx::UpT::Q5K: nhx::k_up<nhx::UpT::Q5K><<<gu, 256, 0, C.s_hit>>>(wup, C.d_q8k, F, D / 256, p.up_row, C.d_upo); break;
-    default: nhx::k_up<nhx::UpT::Q6K><<<gu, 256, 0, C.s_hit>>>(wup, C.d_q8k, F, D / 256, p.up_row, C.d_upo); break;
+    case nhx::UpT::Q4K: nhx::k_up<nhx::UpT::Q4K><<<gu, 256, 0, C.s_hit>>>(wup, C.d_q8k, F, D / 256, p.up_row, C.d_upo, xi); break;
+    case nhx::UpT::Q5K: nhx::k_up<nhx::UpT::Q5K><<<gu, 256, 0, C.s_hit>>>(wup, C.d_q8k, F, D / 256, p.up_row, C.d_upo, xi); break;
+    default: nhx::k_up<nhx::UpT::Q6K><<<gu, 256, 0, C.s_hit>>>(wup, C.d_q8k, F, D / 256, p.up_row, C.d_upo, xi); break;
     }
     nhx::k_relu2_q8_0<<<gq, 256, 0, C.s_hit>>>(C.d_upo, F, C.d_hq);
     if (dt == nhx::DownT::Q50) nhx::k_down<nhx::DownT::Q50><<<gd, 256, 0, C.s_hit>>>(wdn, C.d_hq, D, F / 32, p.dn_row, col, C.d_out);
     else nhx::k_down<nhx::DownT::IQ4NL><<<gd, 256, 0, C.s_hit>>>(wdn, C.d_hq, D, F / 32, p.dn_row, col, C.d_out);
 }
 
-// lo PLAN: src0 = latent [n_in, 1, 1] f32, src1 = selected [22, 1] i32 (a view); dst = plan bytes
+// lo PLAN: src0 = latent [n_in, 1, T] f32, src1 = selected [22, T] i32 (a view); dst = plan bytes
 void op_plan_lo(ggml_tensor* dst, int ith, int nth, void* ud) {
     (void) nth;
     if (ith != 0) return;
@@ -410,13 +424,16 @@ void op_plan_lo(ggml_tensor* dst, int ith, int nth, void* ud) {
     CacheCtx& C = *g_cache;
     const ggml_tensor* lat = dst->src[0];
     const ggml_tensor* sel = dst->src[1];
+    const int T = (int) lat->ne[2];
     uint8_t* plan = (uint8_t*) dst->data;
     int32_t* pi = (int32_t*) plan;
-    int32_t *miss_k = pi + 2, *hit_k = pi + 2 + 22, *hit_slot = pi + 2 + 44;
-    C.q8k_tr->from_float((const float*) lat->data, plan + PLAN_Q8K_OFF, C.n_in);
+    int32_t *miss_k = pi + 3, *hit_k = pi + 3 + NU_MAX, *hit_slot = pi + 3 + 2 * NU_MAX;
+    for (int t = 0; t < T; ++t)
+        C.q8k_tr->from_float((const float*) ((const char*) lat->data + (size_t) t * lat->nb[2]),
+                             plan + PLAN_Q8K_OFF + (size_t) t * PLAN_Q8K_ROW, C.n_in);
     int n_miss = 0, n_hit = 0;
-    for (int k = 0; k < C.n_used; ++k) {
-        const int e = *(const int32_t*) ((const char*) sel->data + (size_t) k * sel->nb[0]);
+    for (int k = 0; k < C.n_used * T; ++k) {
+        const int e = sel_at(sel, k, C.n_used);
         const int s = p.slot_of[(size_t) e];
         bool ok = s >= 0;
         if (ok && p.pending[(size_t) s]) {
@@ -432,22 +449,25 @@ void op_plan_lo(ggml_tensor* dst, int ith, int nth, void* ud) {
     }
     pi[0] = n_miss;
     pi[1] = n_hit;
+    pi[2] = T;
     p.hits += n_hit;
     p.misses += n_miss;
     p.ctr_up.store(0);
     p.ctr_dn.store(0);
     if (n_hit) {
         const uint8_t** hu = (const uint8_t**) C.h_args;
-        const uint8_t** hd = hu + 22;
-        int* col = (int*) (C.h_args + 2 * 22 * sizeof(void*));
+        const uint8_t** hd = hu + NU_MAX;
+        int* xi = (int*) (C.h_args + 2 * NU_MAX * sizeof(void*));
+        int* col = xi + NU_MAX;
         for (int h = 0; h < n_hit; ++h) {
             hu[h] = (const uint8_t*) p.t_up->data + (size_t) hit_slot[h] * p.up_exp;
             hd[h] = (const uint8_t*) p.t_dn->data + (size_t) hit_slot[h] * p.dn_exp;
+            xi[h] = hit_k[h] / C.n_used;
             col[h] = h;
         }
-        std::memcpy(C.h_q8k, plan + PLAN_Q8K_OFF, (size_t) (C.n_in / 256) * nhx::Q8K_BYTES);
-        cudaMemcpyAsync(C.d_args, C.h_args, 2 * 22 * sizeof(void*) + 22 * sizeof(int), cudaMemcpyHostToDevice, C.s_hit);
-        cudaMemcpyAsync(C.d_q8k, C.h_q8k, (size_t) (C.n_in / 256) * nhx::Q8K_BYTES, cudaMemcpyHostToDevice, C.s_hit);
+        std::memcpy(C.h_q8k, plan + PLAN_Q8K_OFF, (size_t) T * PLAN_Q8K_ROW);
+        cudaMemcpyAsync(C.d_args, C.h_args, ARGS_BYTES, cudaMemcpyHostToDevice, C.s_hit);
+        cudaMemcpyAsync(C.d_q8k, C.h_q8k, (size_t) T * PLAN_Q8K_ROW, cudaMemcpyHostToDevice, C.s_hit);
         launch_hits(C, p, n_hit);
         cudaMemcpyAsync(C.h_out, C.d_out, (size_t) n_hit * C.n_in * sizeof(float), cudaMemcpyDeviceToHost, C.s_hit);
         cudaEventRecord(C.ev_hit, C.s_hit);
@@ -455,7 +475,7 @@ void op_plan_lo(ggml_tensor* dst, int ith, int nth, void* ud) {
     p.t_plan += now_s() - t0;
 }
 
-// lo UP: src0 = plan; dst = [34*n_ff/32, 22] I8: q8_0(relu^2(up)) of each miss column (by miss index)
+// lo UP: src0 = plan, src1 = selected; dst = [34*n_ff/32, NU_MAX] I8: q8_0(relu^2(up)) of each miss (by miss index)
 void op_up_lo(ggml_tensor* dst, int ith, int nth, void* ud) {
     (void) nth;
     const double t0 = now_s();
@@ -472,12 +492,13 @@ void op_up_lo(ggml_tensor* dst, int ith, int nth, void* ud) {
         const int u = p.ctr_up.fetch_add(1);
         if (u >= n_miss * nblk) break;
         const int m = u / nblk, b = u % nblk;
-        const int k = pi[2 + m];
-        const int e = *(const int32_t*) ((const char*) sel->data + (size_t) k * sel->nb[0]);
+        const int k = pi[3 + m];
+        const int e = sel_at(sel, k, C.n_used);
+        const uint8_t* q8k = plan + PLAN_Q8K_OFF + (size_t) (k / C.n_used) * PLAN_Q8K_ROW;
         const uint8_t* base = p.host_up + (size_t) e * p.up_exp + (size_t) b * 32 * p.up_row;
         for (int r = 0; r < 32; ++r) {
             float v;
-            tr->vec_dot(C.n_in, &v, 0, base + (size_t) r * p.up_row, 0, plan + PLAN_Q8K_OFF, 0, 1);
+            tr->vec_dot(C.n_in, &v, 0, base + (size_t) r * p.up_row, 0, q8k, 0, 1);
             v = v > 0.f ? v : 0.f;
             h[r] = v * v;
         }
@@ -487,16 +508,18 @@ void op_up_lo(ggml_tensor* dst, int ith, int nth, void* ud) {
 }
 
 void admit_lo(CacheCtx& C, SlotPool& p, const ggml_tensor* sel, const int32_t* pi) {
-    const int n_miss = pi[0], n_hit = pi[1];
+    const int n_miss = pi[0], n_hit = pi[1], T = pi[2];
     std::vector<uint8_t> in_use((size_t) p.cap, 0);
-    for (int h = 0; h < n_hit; ++h) in_use[(size_t) pi[2 + 44 + h]] = 1;
-    for (int k = 0; k < C.n_used; ++k) touch(p, *(const int32_t*) ((const char*) sel->data + (size_t) k * sel->nb[0]), C.step, C.decay);
+    for (int h = 0; h < n_hit; ++h) in_use[(size_t) pi[3 + 2 * NU_MAX + h]] = 1;
+    for (int k = 0; k < C.n_used * T; ++k) touch(p, sel_at(sel, k, C.n_used), C.step, C.decay);
     // candidates: misses by score, best first
     std::vector<std::pair<double, int>> cand;
     for (int m = 0; m < n_miss; ++m) {
-        const int e = *(const int32_t*) ((const char*) sel->data + (size_t) pi[2 + m] * sel->nb[0]);
+        const int e = sel_at(sel, pi[3 + m], C.n_used);
         if (p.slot_of[(size_t) e] >= 0) continue;   // pending upload
-        cand.push_back({eff_score(p, e, C.step, C.decay), e});
+        bool dup = false;
+        for (auto& c : cand) dup = dup || c.second == e;
+        if (!dup) cand.push_back({eff_score(p, e, C.step, C.decay), e});
     }
     std::sort(cand.rbegin(), cand.rend());
     int admitted = 0;
@@ -533,7 +556,7 @@ void admit_lo(CacheCtx& C, SlotPool& p, const ggml_tensor* sel, const int32_t* p
     }
 }
 
-// lo DOWN: src0 = UP's q8_0 bytes, src1 = plan, src2 = selected; dst = [n_in, 22, 1] f32 (the ffn_moe_down of llama)
+// lo DOWN: src0 = UP's q8_0 bytes, src1 = plan, src2 = selected; dst = [n_in, 22, T] f32 (llama's ffn_moe_down)
 void op_down_lo(ggml_tensor* dst, int ith, int nth, void* ud) {
     (void) nth;
     const double t0 = now_s();
@@ -550,8 +573,8 @@ void op_down_lo(ggml_tensor* dst, int ith, int nth, void* ud) {
         const int u = p.ctr_dn.fetch_add(1);
         if (u >= n_miss * nch) break;
         const int m = u / nch, c = u % nch;
-        const int k = pi[2 + m];
-        const int e = *(const int32_t*) ((const char*) sel->data + (size_t) k * sel->nb[0]);
+        const int k = pi[3 + m];
+        const int e = sel_at(sel, k, C.n_used);
         const uint8_t* base = p.host_dn + (size_t) e * p.dn_exp;
         const uint8_t* y = hq + (size_t) m * nblk * nhx::Q80_BYTES;
         for (int r = c * rows; r < (c + 1) * rows; ++r)
@@ -562,7 +585,7 @@ void op_down_lo(ggml_tensor* dst, int ith, int nth, void* ud) {
         if (n_hit) {
             cudaEventSynchronize(C.ev_hit);
             for (int h = 0; h < n_hit; ++h)
-                std::memcpy(out + (size_t) pi[2 + 22 + h] * C.n_in, C.h_out + (size_t) h * C.n_in, sizeof(float) * C.n_in);
+                std::memcpy(out + (size_t) pi[3 + NU_MAX + h] * C.n_in, C.h_out + (size_t) h * C.n_in, sizeof(float) * C.n_in);
         }
         const double t2 = now_s();
         admit_lo(C, p, sel, pi);
@@ -571,7 +594,8 @@ void op_down_lo(ggml_tensor* dst, int ith, int nth, void* ud) {
     }
 }
 
-// hi PLAN (T == 1): src0 = selected [22, 1]; dst = slot ids [22, 1] i32 for mul_mat_id on the pool tensors
+// hi PLAN (T <= NH_TMAX): src0 = selected [22, T]; dst = slot ids [22, T] i32 for mul_mat_id on the pool tensors.  Every
+// expert of the T tokens is resident when it returns (missing ones uploaded synchronously from pinned memory).
 void op_plan_hi(ggml_tensor* dst, int ith, int nth, void* ud) {
     (void) nth;
     if (ith != 0) return;
@@ -579,17 +603,18 @@ void op_plan_hi(ggml_tensor* dst, int ith, int nth, void* ud) {
     SlotPool& p = *static_cast<SlotPool*>(ud);
     CacheCtx& C = *g_cache;
     const ggml_tensor* sel = dst->src[0];
+    const int T = (int) sel->ne[1], NK = C.n_used * T;
     int32_t* ids = (int32_t*) dst->data;
-    std::vector<int> es((size_t) C.n_used);
+    std::vector<int> es((size_t) NK);
     std::vector<uint8_t> in_use((size_t) p.cap, 0);
-    for (int k = 0; k < C.n_used; ++k) {
-        es[(size_t) k] = *(const int32_t*) ((const char*) sel->data + (size_t) k * sel->nb[0]);
+    for (int k = 0; k < NK; ++k) {
+        es[(size_t) k] = sel_at(sel, k, C.n_used);
         touch(p, es[(size_t) k], C.step, C.decay);
         const int s = p.slot_of[(size_t) es[(size_t) k]];
         if (s >= 0) in_use[(size_t) s] = 1;
     }
     bool up = false;
-    for (int k = 0; k < C.n_used; ++k) {
+    for (int k = 0; k < NK; ++k) {
         const int e = es[(size_t) k];
         int s = p.slot_of[(size_t) e];
         if (s >= 0) {
@@ -606,7 +631,7 @@ void op_plan_hi(ggml_tensor* dst, int ith, int nth, void* ud) {
                     s = j;
                 }
             }
-            if (s < 0) throw std::runtime_error("nh_engine: hi pool smaller than n_expert_used");
+            if (s < 0) throw std::runtime_error("nh_engine: hi pool smaller than the experts of one step");
             if (p.exp_of[(size_t) s] >= 0) p.slot_of[(size_t) p.exp_of[(size_t) s]] = -1;
             p.exp_of[(size_t) s] = e;
             p.slot_of[(size_t) e] = s;
@@ -618,7 +643,7 @@ void op_plan_hi(ggml_tensor* dst, int ith, int nth, void* ud) {
             p.uploads++;
             up = true;
         }
-        ids[k] = s;
+        *(int32_t*) ((char*) ids + (size_t) (k % C.n_used) * dst->nb[0] + (size_t) (k / C.n_used) * dst->nb[1]) = s;
     }
     const double t1 = now_s();
     if (up) cudaStreamSynchronize(C.s_hi);
@@ -664,6 +689,12 @@ struct Engine {
     DumpCtx dump;
     ProfCtx prof;
     CacheCtx C;
+    // speculative decoding: verify batches (T <= NH_TMAX tokens computed with T == 1 numerics), rollback snapshots
+    bool verify = false, want_h = false;
+    int64_t vpos0 = 0;
+    int k_snap = 1;                 // recurrent-state rows per slot: 1 + rollback snapshots
+    std::vector<float> hrows;       // result_norm rows of the last decode (want_h)
+    int64_t kv_len(int64_t n) const { return std::min<int64_t>(M.n_ctx, std::max<int64_t>(256, ((n + 255) / 256) * 256)); }
     int n_cpu_moe = 68;      // numerics split: experts of blocks < n_cpu_moe follow llama.cpp's CPU path
     bool pin = false;
     long cache_mib = -1;     // -1: auto (keep the Gate 3 VRAM limit)
@@ -694,8 +725,8 @@ struct Engine {
         for (int il = 0; il < nl; ++il) {
             const nh::Kind kd = W.L[(size_t) il].kind;
             if (kd == nh::Kind::Mamba) {
-                M.r[(size_t) il] = ggml_new_tensor_2d(M.ctx, GGML_TYPE_F32, n_embd_r(), n_slots);
-                M.s[(size_t) il] = ggml_new_tensor_2d(M.ctx, GGML_TYPE_F32, n_embd_s(), n_slots);
+                M.r[(size_t) il] = ggml_new_tensor_2d(M.ctx, GGML_TYPE_F32, n_embd_r(), (int64_t) n_slots * k_snap);
+                M.s[(size_t) il] = ggml_new_tensor_2d(M.ctx, GGML_TYPE_F32, n_embd_s(), (int64_t) n_slots * k_snap);
                 ggml_format_name(M.r[(size_t) il], "cache_r_l%d", il);
                 ggml_format_name(M.s[(size_t) il], "cache_s_l%d", il);
             } else if (kd == nh::Kind::Attention) {
@@ -750,7 +781,7 @@ struct Engine {
         const nh::Geometry& g = W.g;
         const int64_t d_conv = g.ssm_d_conv, d_inner = g.ssm_d_inner, d_state = g.ssm_d_state, n_head = g.ssm_n_head;
         const int64_t head_dim = d_inner / n_head, n_group = g.ssm_n_group;
-        const int64_t n_seqs = 1, n_seq_tokens = T, K = 1;
+        const int64_t n_seqs = 1, n_seq_tokens = T, K = verify ? T : 1;   // verify: T rollback snapshots
         const int64_t mem_size = M.n_slots, kv_head = slot, n_rs = 1;
         ggml_tensor* conv_states_all = M.r[(size_t) il];
         ggml_tensor* ssm_states_all = M.s[(size_t) il];
@@ -862,11 +893,31 @@ struct Engine {
         k = ggml_permute(ctx0, k, 0, 2, 1, 3);
         v = ggml_permute(ctx0, v, 0, 2, 1, 3);
         const float kq_scale = 1.0f / std::sqrt((float) hd);
-        ggml_tensor* o = ggml_flash_attn_ext(ctx0, q, k, v, gi.kq_mask, kq_scale, 0.0f, 0.0f);
-        ggml_flash_attn_ext_add_sinks(o, nullptr);
-        ggml_flash_attn_ext_set_n_kv_max(o, 0);
-        ggml_prec_set_acc(o, GGML_PREC_F32);
-        o = ggml_reshape_2d(ctx0, o, o->ne[0] * o->ne[1], o->ne[2] * o->ne[3]);
+        ggml_tensor* o = nullptr;
+        if (!verify || T == 1) {
+            o = ggml_flash_attn_ext(ctx0, q, k, v, gi.kq_mask, kq_scale, 0.0f, 0.0f);
+            ggml_flash_attn_ext_add_sinks(o, nullptr);
+            ggml_flash_attn_ext_set_n_kv_max(o, 0);
+            ggml_prec_set_acc(o, GGML_PREC_F32);
+            o = ggml_reshape_2d(ctx0, o, o->ne[0] * o->ne[1], o->ne[2] * o->ne[3]);
+        } else {
+            // verify batch: one flash attention per token with the KV length and mask row a T == 1 step at that position
+            // uses (the kernel choice and the KV split depend on the query count and on n_kv)
+            for (int64_t t = 0; t < T; ++t) {
+                const int64_t nkv_t = kv_len(vpos0 + t + 1);
+                ggml_tensor* qt = ggml_view_4d(ctx0, q, q->ne[0], 1, q->ne[2], q->ne[3], q->nb[1], q->nb[2], q->nb[3], (size_t) t * q->nb[1]);
+                ggml_tensor* kt = ggml_view_4d(ctx0, k, k->ne[0], nkv_t, k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
+                ggml_tensor* vt = ggml_view_4d(ctx0, v, v->ne[0], nkv_t, v->ne[2], v->ne[3], v->nb[1], v->nb[2], v->nb[3], 0);
+                ggml_tensor* mt = ggml_view_4d(ctx0, gi.kq_mask, nkv_t, 1, 1, 1, gi.kq_mask->nb[1], gi.kq_mask->nb[2], gi.kq_mask->nb[3],
+                                               (size_t) t * gi.kq_mask->nb[1]);
+                ggml_tensor* ot = ggml_flash_attn_ext(ctx0, qt, kt, vt, mt, kq_scale, 0.0f, 0.0f);
+                ggml_flash_attn_ext_add_sinks(ot, nullptr);
+                ggml_flash_attn_ext_set_n_kv_max(ot, 0);
+                ggml_prec_set_acc(ot, GGML_PREC_F32);
+                ot = ggml_reshape_2d(ctx0, ot, ot->ne[0] * ot->ne[1], ot->ne[2] * ot->ne[3]);
+                o = t == 0 ? ot : ggml_concat(ctx0, o, ot, 1);
+            }
+        }
         ggml_build_forward_expand(gf, o);
         ggml_format_name(o, "kqv_out-%d", il);
         o = ggml_mul_mat(ctx0, l.wo, o);
@@ -913,7 +964,8 @@ struct Engine {
         ggml_tensor* experts = nullptr;
         SlotPool* pool = C.on ? C.pools[(size_t) il].get() : nullptr;
         const bool lo = il < n_cpu_moe;
-        if (pool && n_tokens == 1 && lo) {
+        const bool cached_step = n_tokens == 1 || (verify && n_tokens <= NH_TMAX);
+        if (pool && cached_step && lo) {
             // the CPU path of llama.cpp (ffn_moe_up / relu / sqr / ffn_moe_down on ggml-cpu), split into cached hits
             // (CPU-exact CUDA kernels) and misses (ggml-cpu vec_dot), see SlotPool
             ggml_tensor* a0[2] = {cur, selected};
@@ -922,7 +974,7 @@ struct Engine {
             ggml_backend_sched_set_tensor_backend(sched, plan, cpu);
             ggml_tensor* a1[2] = {plan, selected};
             const int64_t n_ff = l.up_exps->ne[1];
-            ggml_tensor* hq = ggml_custom_4d(ctx0, GGML_TYPE_I8, n_ff / 32 * (int64_t) nhx::Q80_BYTES, n_used, 1, 1, a1, 2,
+            ggml_tensor* hq = ggml_custom_4d(ctx0, GGML_TYPE_I8, n_ff / 32 * (int64_t) nhx::Q80_BYTES, n_used * n_tokens, 1, 1, a1, 2,
                                              op_up_lo, GGML_N_TASKS_MAX, pool);
             ggml_format_name(hq, "nhc_up-%d", il);
             ggml_backend_sched_set_tensor_backend(sched, hq, cpu);
@@ -930,19 +982,25 @@ struct Engine {
             experts = ggml_custom_4d(ctx0, GGML_TYPE_F32, n_embd, n_used, n_tokens, 1, a2, 3, op_down_lo, GGML_N_TASKS_MAX, pool);
             ggml_backend_sched_set_tensor_backend(sched, experts, cpu);
             ggml_format_name(experts, "ffn_moe_down-%d", il);
-        } else if (pool && n_tokens == 1) {
-            // resident-numerics block: the same mul_mat_id on the slot pool, ids remapped by the plan op
+        } else if (pool && cached_step) {
+            // resident-numerics block: the same mul_mat_id on the slot pool, ids remapped by the plan op.  A verify batch
+            // runs it once per token (the T == 1 kernel: ggml-cuda's multi-token MoE kernel reduces differently)
             ggml_tensor* a0[1] = {selected};
-            ggml_tensor* ids = ggml_custom_4d(ctx0, GGML_TYPE_I32, n_used, 1, 1, 1, a0, 1, op_plan_hi, 1, pool);
+            ggml_tensor* ids = ggml_custom_4d(ctx0, GGML_TYPE_I32, n_used, n_tokens, 1, 1, a0, 1, op_plan_hi, 1, pool);
             ggml_format_name(ids, "nhc_ids-%d", il);
             ggml_backend_sched_set_tensor_backend(sched, ids, cpu);
-            ggml_tensor* up = ggml_mul_mat_id(ctx0, pool->t_up, cur, ids);
-            ggml_format_name(up, "ffn_moe_up-%d", il);
-            cur = ggml_relu(ctx0, up);
-            cur = ggml_sqr(ctx0, cur);
-            ggml_format_name(cur, "ffn_moe_relu_sqr-%d", il);
-            experts = ggml_mul_mat_id(ctx0, pool->t_dn, cur, ids);
-            ggml_format_name(experts, "ffn_moe_down-%d", il);
+            for (int64_t t = 0; t < n_tokens; ++t) {
+                ggml_tensor* ct = n_tokens == 1 ? cur : ggml_view_3d(ctx0, cur, n_embd, 1, 1, cur->nb[1], cur->nb[2], (size_t) t * cur->nb[2]);
+                ggml_tensor* it = n_tokens == 1 ? ids : ggml_view_2d(ctx0, ids, n_used, 1, ids->nb[1], (size_t) t * ids->nb[1]);
+                ggml_tensor* up = ggml_mul_mat_id(ctx0, pool->t_up, ct, it);
+                ggml_format_name(up, "ffn_moe_up-%d", il);
+                ggml_tensor* h = ggml_relu(ctx0, up);
+                h = ggml_sqr(ctx0, h);
+                ggml_format_name(h, "ffn_moe_relu_sqr-%d", il);
+                ggml_tensor* dn = ggml_mul_mat_id(ctx0, pool->t_dn, h, it);
+                ggml_format_name(dn, "ffn_moe_down-%d", il);
+                experts = t == 0 ? dn : ggml_concat(ctx0, experts, dn, 2);
+            }
         } else {
             ggml_tensor* up = ggml_mul_mat_id(ctx0, l.up_exps, cur, selected);
             ggml_format_name(up, "ffn_moe_up-%d", il);
@@ -1039,6 +1097,10 @@ struct Engine {
         }
         ggml_tensor* cur = build_norm(inpL, W.output_norm, -1);
         ggml_set_name(cur, "result_norm");
+        if (want_h) {
+            ggml_set_output(cur);
+            gi.h = cur;
+        }
         cur = ggml_mul_mat(ctx0, W.output, cur);
         ggml_set_name(cur, "result_output");
         ggml_set_output(cur);
@@ -1136,14 +1198,15 @@ struct Engine {
         ck(cudaStreamCreateWithFlags(&C.s_copy, cudaStreamNonBlocking), "stream");
         ck(cudaStreamCreateWithFlags(&C.s_hi, cudaStreamNonBlocking), "stream");
         ck(cudaEventCreateWithFlags(&C.ev_hit, cudaEventDisableTiming), "event");
-        const size_t NU = 22, F = (size_t) C.n_ff, D = (size_t) C.n_in;
-        ck(cudaMalloc(&C.d_args, 1024), "scratch");
-        ck(cudaMalloc(&C.d_q8k, 4 * nhx::Q8K_BYTES), "scratch");
+        const size_t NU = NU_MAX, F = (size_t) C.n_ff, D = (size_t) C.n_in;
+        if (C.n_in != 1024) throw std::runtime_error("nh_engine cache: plan layout assumes a 1024-wide latent");
+        ck(cudaMalloc(&C.d_args, ARGS_BYTES), "scratch");
+        ck(cudaMalloc(&C.d_q8k, NH_TMAX * PLAN_Q8K_ROW), "scratch");
         ck(cudaMalloc(&C.d_upo, NU * F * 4), "scratch");
         ck(cudaMalloc(&C.d_hq, NU * (F / 32) * nhx::Q80_BYTES), "scratch");
         ck(cudaMalloc(&C.d_out, NU * D * 4), "scratch");
-        ck(cudaHostAlloc(&C.h_args, 1024, cudaHostAllocDefault), "pinned");
-        ck(cudaHostAlloc(&C.h_q8k, 4 * nhx::Q8K_BYTES, cudaHostAllocDefault), "pinned");
+        ck(cudaHostAlloc(&C.h_args, ARGS_BYTES, cudaHostAllocDefault), "pinned");
+        ck(cudaHostAlloc(&C.h_q8k, NH_TMAX * PLAN_Q8K_ROW, cudaHostAllocDefault), "pinned");
         ck(cudaHostAlloc(&C.h_out, NU * D * 4, cudaHostAllocDefault), "pinned");
         // VRAM budget: what is free now minus what keeps the process under vram_limit_used, minus a margin for
         // CUDA graphs / cuBLAS workspaces that appear at the first decode
@@ -1262,11 +1325,18 @@ struct Engine {
     void clear_slot(int slot) { M.n_past[(size_t) slot] = 0; }
 
     // one ubatch of tokens for `slot`; all_out: logits for every token, else for the last one only
-    void decode(const int32_t* tok, int64_t T, int slot, bool all_out) {
+    // verify_: a speculative verify batch (all outputs; every token computed as a T == 1 step would compute it; the
+    // recurrent states keep T rollback snapshots, see spec_commit).  want_h_: also return the result_norm rows (hrows).
+    void decode(const int32_t* tok, int64_t T, int slot, bool all_out, bool verify_ = false, bool want_h_ = false) {
         const int64_t pos0 = M.n_past[(size_t) slot];
         if (pos0 + T > M.n_ctx) throw std::runtime_error("nh_engine: context full");
-        if (C.on && T == 1) C.step++;
-        const int64_t n_kv = std::min<int64_t>(M.n_ctx, std::max<int64_t>(256, ((pos0 + T + 255) / 256) * 256));
+        if (verify_ && (T > NH_TMAX || T > k_snap)) throw std::runtime_error("nh_engine: verify batch too large");
+        verify = verify_ && T > 1;
+        want_h = want_h_;
+        vpos0 = pos0;
+        if (verify_) all_out = true;
+        if (C.on && (T == 1 || verify)) C.step++;
+        const int64_t n_kv = kv_len(pos0 + T);
         const int64_t n_out = all_out ? T : 1;
         const int64_t rs_zero = pos0 == 0 ? slot : -1;
         GraphIn gi;
@@ -1309,11 +1379,149 @@ struct Engine {
         const size_t nv = (size_t) gi.logits->ne[0];
         logits.resize(nv * (size_t) n_out);
         ggml_backend_tensor_get(gi.logits, logits.data(), 0, logits.size() * 4);
+        if (want_h && gi.h) {
+            hrows.resize((size_t) ggml_nelements(gi.h));
+            ggml_backend_tensor_get(gi.h, hrows.data(), 0, hrows.size() * 4);
+        }
         ggml_free(ctx0);
         ctx0 = nullptr;
+        verify = false;
+        want_h = false;
         M.n_past[(size_t) slot] = (int) (pos0 + T);
     }
+
+    // after a verify batch of T tokens at pos0: keep the first a (1 <= a <= T).  The KV cells past pos0 + a stay but are
+    // masked; the recurrent states go back to the snapshot taken after token a - 1 (snapshot row T - a, ssm-scan.cu)
+    void spec_commit(int slot, int64_t pos0, int T, int a) {
+        M.n_past[(size_t) slot] = (int) (pos0 + a);
+        if (a >= T) return;
+        const int64_t sl = T - a;
+        for (int il = 0; il < W.g.n_layer; ++il) {
+            for (ggml_tensor* t : {M.r[(size_t) il], M.s[(size_t) il]}) {
+                if (!t) continue;
+                const size_t row = t->nb[1];
+                const cudaError_t e = cudaMemcpy((char*) t->data + (size_t) slot * row, (const char*) t->data + (size_t) (sl * M.n_slots + slot) * row,
+                                                 row, cudaMemcpyDeviceToDevice);
+                if (e != cudaSuccess) throw std::runtime_error(std::string("nh_engine: rollback copy: ") + cudaGetErrorString(e));
+            }
+        }
+    }
 };
+
+// ---- speculative decoding (Phase 4): drafts from prompt lookup (n-gram) and/or the MTP head, verified greedily in
+// one batch whose every row is computed with T == 1 numerics (Engine::decode verify), so the accepted tokens and
+// their logits rows equal the plain T == 1 decode's ----
+struct SpecStats {
+    long steps = 0, drafted = 0, accepted = 0, plain_steps = 0;
+    long src_drafted[3] = {0, 0, 0}, src_accepted[3] = {0, 0, 0}, src_steps[3] = {0, 0, 0};   // 0 ngram, 1 mtp, 2 mixed
+    std::map<int, long> acc_hist;   // accepted drafts per verify step
+    double t_draft = 0, t_verify = 0, t_plain = 0, t_commit = 0;
+};
+
+// most recent earlier occurrence of the last n context tokens (n = nmax .. nmin), and up to k tokens that followed it
+std::vector<int32_t> ngram_propose(const std::vector<int32_t>& c, int k, int nmin, int nmax, int* n_match) {
+    *n_match = 0;
+    const int64_t L = (int64_t) c.size();
+    for (int n = nmax; n >= nmin; --n) {
+        if (L < n + 1) continue;
+        const int32_t* suf = c.data() + L - n;
+        for (int64_t i = L - n - 1; i >= 0; --i) {
+            if (c[(size_t) i] != suf[0] || !std::equal(suf, suf + n, c.data() + i)) continue;
+            std::vector<int32_t> d;
+            for (int j = 0; j < k && i + n + j < L; ++j) d.push_back(c[(size_t) (i + n + j)]);
+            if (!d.empty()) {
+                *n_match = n;
+                return d;
+            }
+        }
+    }
+    return {};
+}
+
+struct SpecCfg {
+    int mode = 0;        // 0 off, 1 ngram, 2 mtp, 3 auto (both)
+    int k = 3;           // max drafts per step (verify batch = k + 1 <= NH_TMAX)
+    int ng_min = 2, ng_max = 4;
+};
+
+// Generation after the prompt: `last` = logits of the last prompt token.  Emits tokens (and, through on_row, the logits
+// row that predicted each one) exactly as the plain loop does: same tokens, same rows, same stop rules.
+template <class OnRow>
+void spec_generate(Engine& E, const SpecCfg& cfg, SpecStats& st, std::vector<int32_t> ctx_toks, std::vector<float> last,
+                   int maxgen, bool stop_eog, const std::set<int>& eog, std::vector<int32_t>& out, OnRow on_row,
+                   std::vector<double>* t_tok) {
+    const int nv = (int) last.size();
+    std::vector<float> row((size_t) nv);
+    for (;;) {
+        const int x = argmax(last.data(), nv);
+        on_row(last.data(), x);
+        out.push_back(x);
+        ctx_toks.push_back(x);
+        if (t_tok) t_tok->push_back(now_s());
+        if ((stop_eog && eog.count(x)) || (int) out.size() >= maxgen) break;
+        const double td0 = now_s();
+        int nm = 0;
+        std::vector<int32_t> d;
+        const int kmax = std::min(cfg.k, std::min(NH_TMAX - 1, maxgen - (int) out.size()));
+        if (kmax > 0 && (cfg.mode == 1 || cfg.mode == 3)) d = ngram_propose(ctx_toks, kmax, cfg.ng_min, cfg.ng_max, &nm);
+        st.t_draft += now_s() - td0;
+        const int64_t pos0 = E.M.n_past[0];
+        if (d.empty()) {
+            const double t0 = now_s();
+            E.decode(&out.back(), 1, 0, false);
+            std::memcpy(last.data(), E.logits.data(), sizeof(float) * (size_t) nv);
+            st.plain_steps++;
+            st.t_plain += now_s() - t0;
+            continue;
+        }
+        std::vector<int32_t> toks{x};
+        toks.insert(toks.end(), d.begin(), d.end());
+        const int T = (int) toks.size();
+        const double t0 = now_s();
+        E.decode(toks.data(), T, 0, true, true);
+        st.t_verify += now_s() - t0;
+        st.steps++;
+        st.drafted += T - 1;
+        st.src_drafted[0] += T - 1;
+        st.src_steps[0]++;
+        int a = 1;
+        bool stop = false;
+        for (int i = 0; i < T - 1; ++i) {
+            const float* Li = E.logits.data() + (size_t) i * nv;
+            if (argmax(Li, nv) != d[(size_t) i]) break;
+            on_row(Li, d[(size_t) i]);
+            out.push_back(d[(size_t) i]);
+            ctx_toks.push_back(d[(size_t) i]);
+            if (t_tok) t_tok->push_back(now_s());
+            a++;
+            if ((stop_eog && eog.count(d[(size_t) i])) || (int) out.size() >= maxgen) {
+                stop = true;
+                break;
+            }
+        }
+        st.accepted += a - 1;
+        st.src_accepted[0] += a - 1;
+        st.acc_hist[a - 1]++;
+        if (stop) break;
+        std::memcpy(last.data(), E.logits.data() + (size_t) (a - 1) * nv, sizeof(float) * (size_t) nv);
+        const double tc = now_s();
+        E.spec_commit(0, pos0, T, a);
+        st.t_commit += now_s() - tc;
+    }
+}
+
+void print_spec_stats(const SpecStats& st, FILE* f) {
+    std::fprintf(f, "[spec] verify steps %ld plain steps %ld drafted %ld accepted %ld (rate %.4f, mean accepted/verify %.4f); "
+                    "time draft %.3f verify %.3f plain %.3f commit %.3f s\n", st.steps, st.plain_steps, st.drafted, st.accepted,
+                 st.drafted ? (double) st.accepted / (double) st.drafted : 0.0, st.steps ? (double) st.accepted / (double) st.steps : 0.0,
+                 st.t_draft, st.t_verify, st.t_plain, st.t_commit);
+    const char* nm[3] = {"ngram", "mtp", "mixed"};
+    for (int s = 0; s < 3; ++s)
+        if (st.src_steps[s])
+            std::fprintf(f, "[spec] source %s: steps %ld drafted %ld accepted %ld rate %.4f\n", nm[s], st.src_steps[s], st.src_drafted[s],
+                         st.src_accepted[s], st.src_drafted[s] ? (double) st.src_accepted[s] / (double) st.src_drafted[s] : 0.0);
+    for (auto& kv : st.acc_hist) std::fprintf(f, "[spec] accepted %d: %ld steps\n", kv.first, kv.second);
+}
 
 std::set<std::string> split_ids(const std::string& s) {
     std::set<std::string> r;
@@ -1333,6 +1541,8 @@ int main(int argc, char** argv) {
     int cache_mode = 0, cap_lo = 0, cap_hi = 0, max_admit = 2;
     long cache_mib = -1;
     double cache_decay = 0.97;
+    SpecCfg spec;
+    bool spec_check = false;
     int K = 32, chunk = 512, ctx = 32768, threads = 16, n_cpu_moe = 68;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -1367,6 +1577,13 @@ int main(int argc, char** argv) {
         else if (a == "--cap-hi") cap_hi = std::stoi(nx());
         else if (a == "--cache-decay") cache_decay = std::stod(nx());
         else if (a == "--max-admit") max_admit = std::stoi(nx());
+        else if (a == "--spec") {
+            const std::string v = nx();
+            spec.mode = v == "off" ? 0 : v == "ngram" ? 1 : v == "mtp" ? 2 : v == "auto" ? 3 : -1;
+            if (spec.mode < 0) { std::fprintf(stderr, "--spec off|ngram|mtp|auto\n"); return 2; }
+        }
+        else if (a == "--spec-k") spec.k = std::stoi(nx());
+        else if (a == "--spec-check") spec_check = true;
         else {
             std::fprintf(stderr, "unknown argument %s\n", a.c_str());
             return 2;
@@ -1392,6 +1609,8 @@ int main(int argc, char** argv) {
     E.cap_hi = cap_hi;
     E.C.decay = cache_decay;
     E.C.max_admit = max_admit;
+    if (spec.mode) E.k_snap = NH_TMAX;
+    if (spec.k < 1 || spec.k > NH_TMAX - 1) throw std::runtime_error("--spec-k must be 1.." + std::to_string(NH_TMAX - 1));
     E.init(m, n_cpu_moe, 1, ctx, threads, chunk, cache_mode);
     {
         size_t fr = 0, tot = 0;
@@ -1412,6 +1631,8 @@ int main(int argc, char** argv) {
         if (!bf || !bo) throw std::runtime_error("cannot open bench files");
         std::string name;
         int npred, igeos, reps, ntok;
+        SpecStats sst;
+        long spec_check_bad = 0;
         while (bf >> name >> npred >> igeos >> reps >> ntok) {
             std::vector<int32_t> pt((size_t) ntok);
             for (int i = 0; i < ntok; ++i) bf >> pt[(size_t) i];
@@ -1420,10 +1641,50 @@ int main(int argc, char** argv) {
                 const double t0 = now_s();
                 for (int off = 0; off < ntok; off += chunk) E.decode(pt.data() + off, std::min(chunk, ntok - off), 0, false);
                 std::vector<int32_t> out{argmax(E.logits.data(), nv)};
-                const double t1 = now_s();
-                double t2 = t1;
+                double t1 = now_s();
+                double t2 = t1, t_first_tok = t1;
                 const bool prof_run = profile > 0 && rep == 0;
-                while ((int) out.size() < npred && (igeos || !eog.count(out.back()))) {
+                if (spec.mode && !prof_run) {
+                    // the first token was sampled above; spec_generate re-emits it from `last`, so start from the prompt
+                    out.clear();
+                    std::vector<float> last(E.logits.begin(), E.logits.begin() + nv);
+                    std::vector<double> tt;
+                    std::vector<uint64_t> hs;
+                    auto hrow = [&](const float* lg, int) {
+                        uint64_t h = 1469598103934665603ull;
+                        const uint8_t* b = (const uint8_t*) lg;
+                        for (size_t i = 0; i < (size_t) nv * 4; ++i) h = (h ^ b[i]) * 1099511628211ull;
+                        hs.push_back(h);
+                    };
+                    if (spec_check && rep == 0) {
+                        // reference: the plain T == 1 loop from the same prompt state, then the prompt again for the spec run
+                        SpecCfg plain;
+                        SpecStats pst;
+                        std::vector<int32_t> pout;
+                        spec_generate(E, plain, pst, pt, last, npred, !igeos, eog, pout, hrow, nullptr);
+                        std::vector<uint64_t> phs = hs;
+                        hs.clear();
+                        E.clear_slot(0);
+                        for (int off = 0; off < ntok; off += chunk) E.decode(pt.data() + off, std::min(chunk, ntok - off), 0, false);
+                        spec_generate(E, spec, sst, pt, last, npred, !igeos, eog, out, hrow, &tt);
+                        int bad = 0, first_bad = -1;
+                        for (size_t i = 0; i < std::max(phs.size(), hs.size()); ++i)
+                            if (i >= phs.size() || i >= hs.size() || phs[i] != hs[i]) {
+                                bad++;
+                                if (first_bad < 0) first_bad = (int) i;
+                            }
+                        std::fprintf(stderr, "[spec-check] %s: plain %zu tokens, spec %zu tokens, tokens %s, logits rows bit-identical "
+                                             "%zu/%zu (first diff %d)\n", name.c_str(), pout.size(), out.size(),
+                                     pout == out ? "identical" : "DIFFER", std::max(phs.size(), hs.size()) - (size_t) bad,
+                                     std::max(phs.size(), hs.size()), first_bad);
+                        spec_check_bad += bad + (pout == out ? 0 : 1);
+                    } else {
+                        spec_generate(E, spec, sst, pt, last, npred, !igeos, eog, out, hrow, &tt);
+                    }
+                    t2 = tt.empty() ? t1 : tt.back();
+                    t_first_tok = tt.empty() ? t1 : tt.front();
+                }
+                while (!spec.mode && (int) out.size() < npred && (igeos || !eog.count(out.back()))) {
                     if (prof_run && (int) out.size() == 4) E.prof.on = true;
                     E.decode(&out.back(), 1, 0, false);
                     out.push_back(argmax(E.logits.data(), nv));
@@ -1445,6 +1706,10 @@ int main(int argc, char** argv) {
                     continue;
                 }
                 const int ng = (int) out.size();
+                if (spec.mode) {
+                    // llama-server's timing: prompt time ends when the first token is sampled
+                    t1 = t_first_tok;
+                }
                 const double pms = (t1 - t0) * 1e3, gms = (t2 - t1) * 1e3;
                 std::fprintf(bo, "{\"name\": \"%s\", \"rep\": %d, \"prompt_n\": %d, \"prompt_ms\": %.3f, \"pp_tok_s\": %.4f, "
                                  "\"predicted_n\": %d, \"predicted_ms\": %.3f, \"decode_tok_s\": %.4f, \"ttft_s\": %.4f, \"tokens\": [",
@@ -1458,6 +1723,8 @@ int main(int argc, char** argv) {
         }
         std::fclose(bo);
         E.cache_stats(stderr);
+        if (spec.mode) print_spec_stats(sst, stderr);
+        if (spec_check) std::fprintf(stderr, "[spec-check] total mismatches %ld -> %s\n", spec_check_bad, spec_check_bad ? "FAIL" : "PASS");
         return 0;
     }
     FILE* sumf = std::fopen((outdir + "/capture_log.txt").c_str(), "w");
@@ -1468,6 +1735,7 @@ int main(int argc, char** argv) {
     std::string id;
     int ngen;
     const unsigned nthr = std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
+    SpecStats cap_sst;
     while (lf >> id >> ngen) {
         if (!only_ids.empty() && !only_ids.count(id)) continue;
         const std::vector<int32_t> pt = read_i32(tokdir + "/" + id + ".i32");
@@ -1504,7 +1772,14 @@ int main(int argc, char** argv) {
         }
         std::vector<int32_t> out;
         bool is_eog = false;
-        for (int j = 0; j < maxgen; ++j) {
+        if (spec.mode && force.empty()) {
+            spec_generate(E, spec, cap_sst, pt, last, maxgen, true, eog, out, [&](const float* lg, int t) {
+                rows.emplace_back();
+                make_row(lg, nv, K, t, rows.back());
+            }, nullptr);
+            is_eog = !out.empty() && eog.count(out.back());
+        }
+        for (int j = 0; j < maxgen && !(spec.mode && force.empty()); ++j) {
             const int am = argmax(last.data(), nv);
             const int t = force.empty() ? am : forced[(size_t) j];
             rows.emplace_back();
@@ -1542,5 +1817,6 @@ int main(int argc, char** argv) {
     }
     std::fclose(sumf);
     E.cache_stats(stderr);
+    if (spec.mode) print_spec_stats(cap_sst, stderr);
     return 0;
 }

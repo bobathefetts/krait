@@ -214,9 +214,12 @@ enum class UpT : int { Q4K = 0, Q5K = 1, Q5K_NOFMA = 2, Q6K = 3 };
 enum class DownT : int { Q50 = 0, IQ4NL = 1 };
 
 // up: one block = 32 rows x 8 lanes; grid (ceil(n_rows/32), n_exp).  w[e] = expert e's first row; q8k = 4 q8_K blocks
-// (host-quantised, contiguous as ggml lays them out); out[e*n_rows + r] = raw vec_dot (before relu^2)
+// (host-quantised, contiguous as ggml lays them out); out[e*n_rows + r] = raw vec_dot (before relu^2).
+// xi (optional): item e uses the q8_K row of token xi[e] (q8k + xi[e] * nb q8_K blocks), for several tokens at once
 template <UpT T>
-__global__ void k_up(const uint8_t* const* w, const uint8_t* q8k, int n_rows, int nb, size_t row_bytes, float* out) {
+__global__ void k_up(const uint8_t* const* w, const uint8_t* q8k_base, int n_rows, int nb, size_t row_bytes, float* out,
+                     const int* xi = nullptr) {
+    const uint8_t* q8k = q8k_base + (xi ? (size_t) xi[blockIdx.y] * (size_t) nb * Q8K_BYTES : 0);
     __shared__ Q8KSh y;
     for (int i = threadIdx.x; i < nb * QK_K; i += blockDim.x) y.qs[i / QK_K][i % QK_K] = (int8_t) q8k[(i / QK_K) * Q8K_BYTES + 4 + i % QK_K];
     for (int i = threadIdx.x; i < nb * 16; i += blockDim.x) y.bsums[i / 16][i % 16] = ld16s(q8k + (i / 16) * Q8K_BYTES + 260 + 2 * (i % 16));
