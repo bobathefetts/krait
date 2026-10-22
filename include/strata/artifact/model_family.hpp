@@ -16,7 +16,7 @@ enum class ModelFamily {
     Unknown = 0,
     Qwen4Exp,    ///< Qwen3.8-Flash-Next and its fine-tunes / pruned variants (Swift 1.5, the Coder)
     Qwen35Moe,   ///< Qwen3.6-35B-A3B (Unsloth's MTP GGUFs): plain pre-norm residual, dense attention, nextn MTP block
-    NemotronHMoe,  ///< NVIDIA Nemotron 3.5 Super (nemotron_h_moe): Mamba-2 + NoPE GQA + LatentMoE; src/nemotron_h, port in progress
+    NemotronHMoe,  ///< NVIDIA Nemotron 3.5 Super (nemotron_h_moe): Mamba-2 + NoPE GQA + LatentMoE; its own engine, src/nemotron_h
 };
 
 inline ModelFamily model_family_from_arch(const std::string& arch) {
@@ -64,8 +64,8 @@ inline std::string model_family_not_supported(ModelFamily f) {
     if (model_family_runs(f)) return {};
     if (f == ModelFamily::Unknown) return "this is not a model family Strata knows";
     if (f == ModelFamily::NemotronHMoe)
-        return "Nemotron 3.5 Super (architecture 'nemotron_h_moe') has no engine path yet: only its reference program "
-               "(strata-nhref) and layout check (strata-nh-layout) exist";
+        return "Nemotron 3.5 Super (architecture 'nemotron_h_moe') runs on its own engine, strata-nh-engine "
+               "(nemotron/run-nemotron.sh, docs/NEMOTRON.md), not on this one";
     return std::string(model_family_title(f)) + " (architecture '" + model_family_arch(f) +
            "') runs on the NVIDIA (CUDA) and AMD (HIP) builds of Strata; this build does not run it yet (the Intel "
            "Arc / SYCL port is in development). Use a CUDA or HIP build, or a Qwen3.8-Flash-Next model file";

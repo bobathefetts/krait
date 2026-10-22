@@ -86,6 +86,24 @@ IMAGE_PAD = "<|image_pad|>"
 NEMOTRON_IMAGE = "<image>"       # Nemotron 3.5 Super's picture marker (its chat template; mtmd's nemotron_omni rows)
 
 
+def expand_nemotron_pictures(ids, pad, beg, end, rows):
+    """Nemotron 3.5 Super (nemotron_h_moe): every `pad` (<image>) the chat template wrote becomes `beg` (<img>), one
+    `pad` per picture row and `end` (</img>) - the layout llama.cpp's mtmd (nemotron_omni) builds; the engine puts the
+    picture's rows in place of those `pad`s.  `rows`: the row count of each picture, in prompt order."""
+    out, k = [], 0
+    for t in ids:
+        if t == pad:
+            if k == len(rows):
+                raise ValueError("the prompt and its images do not match")
+            out += list(beg) + [pad] * rows[k] + list(end)
+            k += 1
+        else:
+            out.append(t)
+    if k != len(rows):
+        raise ValueError("the prompt and its images do not match")
+    return out
+
+
 def popen(what: str, args: list, role: str = "engine", **kw):
     """#735: subprocess.Popen, but Windows' refusal to start a program (WinError 4551, or 1260 when a policy blocks it:
     Smart App Control on a clean Windows 11 blocks an exe that is not signed) is said in words instead of a bare
@@ -4698,18 +4716,11 @@ class Service:
             literal = self.tok.encode(IMAGE_PAD, parse_special=False)
             out, k = [], 0
             if nemotron:
-                beg = self.tok.encode("<img>", parse_special=True)
-                end = self.tok.encode("</img>", parse_special=True)
-            for j, t in enumerate(ids):
-                if nemotron:
-                    if t == pad:
-                        if k == len(encoded):
-                            raise ValueError("the prompt and its images do not match")
-                        out += beg + [pad] * encoded[k][1] + end
-                        k += 1
-                    else:
-                        out.append(t)
-                elif t == pad and j > 0 and ids[j - 1] == start:
+                out = expand_nemotron_pictures(ids, pad, self.tok.encode("<img>", parse_special=True),
+                                               self.tok.encode("</img>", parse_special=True), [e[1] for e in encoded])
+                k = len(encoded)
+            for j, t in enumerate(() if nemotron else ids):
+                if t == pad and j > 0 and ids[j - 1] == start:
                     # more pairs than images: text parts that cut both markers apart (the literal marks keep whole ones text)
                     if k == len(encoded):
                         raise ValueError("the prompt and its images do not match")

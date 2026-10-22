@@ -88,3 +88,5 @@ node_modules/
 
 # docker/nemotron: the keys (made from env.example)
 docker/nemotron/.env
+# nemotron/build-nemotron.sh with NH_ROOT = this checkout: the fetched llama.cpp sources
+/third_party/llama.cpp-*

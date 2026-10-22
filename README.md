@@ -215,6 +215,26 @@ Measured on a 16 GB AMD card (RX 9070 XT, Ryzen 9 3900X, 47 GB RAM):
 The bars use one scale for both tables. A card with more VRAM is faster: an RTX 3090 (24 GB) should write about 100-140
 tokens per second. The engine version behind each number is in [DETAILS.md](docs/DETAILS.md#speed-measured).
 
+## Nemotron 3.5 Super (port)
+
+Strata also runs **NVIDIA Nemotron 3.5 Super VL 120B-A12B** (`nemotron_h_moe`, Unsloth's UD-Q4_K_XL GGUF) on one
+32 GB NVIDIA card, with its own engine, `strata-nh-engine`. Text, MTP speculation, pictures, the OpenAI and Anthropic
+API, and up to 4 requests at once. Greedy output is token-identical to llama.cpp b11806.
+
+Measured on an RTX 5090 + Ryzen 9 7950X3D (127 GB RAM, VRAM capped at 29,346 MiB): **23.0 tok/s decode on real
+prompts, 1.61x llama.cpp's 14.3 tok/s on the same machine**; 24.6 tok/s over HTTP; a 32K prompt is read in 63.4 s.
+
+```bash
+nemotron/build-nemotron.sh                 # llama.cpp b11806 ggml + strata-nh-engine + strata-vision
+nemotron/run-nemotron.sh                   # http://127.0.0.1:8095/v1
+docker compose -f docker/nemotron/compose.yml --env-file docker/nemotron/.env up -d   # + Open WebUI + RAG embedder
+```
+
+The shipped config uses `--prefix-reuse off`: every request reads its whole prompt, so served output equals the CLI
+bit for bit. `--prefix-reuse on` keeps a conversation's state between turns and reads only the new tokens. Follow-ups
+are faster, but the output is not bit-identical to a fresh read (measured: 4 of 6 second turns differed). Build,
+flags, benchmarks and tests: [docs/NEMOTRON.md](docs/NEMOTRON.md). Third-party licenses: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
 ## Using it
 
 ### In the app

@@ -284,6 +284,20 @@ if(STRATA_BUILD_TESTS)
   add_executable(model_family_test tests/core/model_family_test.cpp)
   target_link_libraries(model_family_test PRIVATE strata_artifact)
   add_test(NAME model_family_test COMMAND model_family_test)
+  # Nemotron 3.5 Super (nemotron_h_moe): geometry, layout check, GGUF arrays and family name on synthetic GGUFs; the
+  # same program writes the tiny files the strata-nh-layout / strata-nh-engine exit-code tests below read
+  add_executable(nemotron_h_layout_test tests/core/nemotron_h_layout_test.cpp)
+  target_link_libraries(nemotron_h_layout_test PRIVATE strata_artifact)
+  add_test(NAME nemotron_h_layout_test COMMAND nemotron_h_layout_test)
+  add_test(NAME nemotron_h_fixtures COMMAND nemotron_h_layout_test --write ${CMAKE_CURRENT_BINARY_DIR}/nemotron_h_fixtures)
+  set_tests_properties(nemotron_h_fixtures PROPERTIES FIXTURES_SETUP nemotron_h_fixtures)
+  # the server pieces the Nemotron port added (Python standard library + the server's own modules; no model)
+  find_package(Python3 COMPONENTS Interpreter)
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME nemotron_serve_test
+      COMMAND ${Python3_EXECUTABLE} -m unittest -v serve.test_nemotron_frontend serve.test_nemotron_vision
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+  endif()
   # how --batch cuts a prompt read into pieces (a layer split with no slot decoding must still reach a BYIELD)
   add_executable(batch_read_test tests/program/batch_read_test.cpp)
   target_include_directories(batch_read_test PRIVATE include)
@@ -749,11 +763,20 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_executable(strata-q36ref src/qwen35/q36ref.cu)
   target_include_directories(strata-q36ref PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
   target_link_libraries(strata-q36ref PRIVATE strata_kernels strata_warnings ${_strata_gpu_runtime_target})
-  # Nemotron 3.5 Super (nemotron_h_moe), docs/phase2-plan.md in the port's workspace: the layout check (all shards, every
-  # tensor mapped and verified; the mmproj opened but unused)
+  # Nemotron 3.5 Super (nemotron_h_moe), docs/NEMOTRON.md: the layout check (all shards, every tensor mapped and
+  # verified; the mmproj opened but unused)
   add_executable(strata-nh-layout src/nemotron_h/nh_layout_main.cpp)
   target_include_directories(strata-nh-layout PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata-nh-layout PRIVATE strata_warnings)
+  if(STRATA_BUILD_TESTS)   # exit codes on the tiny files nemotron_h_layout_test writes (no model, no GPU)
+    set(_nh_fix ${CMAKE_CURRENT_BINARY_DIR}/nemotron_h_fixtures)
+    set(_nh_expect ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/expect_exit.cmake)
+    add_test(NAME nh_layout_cli_ok COMMAND strata-nh-layout --model ${_nh_fix}/tiny-ok.gguf)
+    add_test(NAME nh_layout_cli_missing COMMAND ${CMAKE_COMMAND} "-DPROG=$<TARGET_FILE:strata-nh-layout>"
+      "-DARGS=--model|${_nh_fix}/tiny-missing.gguf" -DEXPECT=1 "-DMATCH=missing tensor blk.0.ssm_in.weight"
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/expect_exit.cmake)
+    set_tests_properties(nh_layout_cli_ok nh_layout_cli_missing PROPERTIES FIXTURES_REQUIRED nemotron_h_fixtures)
+  endif()
   # the slow reference engine for the same family (all 88 layers, fp32 SGEMM over dequantised weights, routed experts
   # paged from the mapping into a VRAM slot cache), checked against llama.cpp with the port's golden-set harness
   add_executable(strata-nhref src/nemotron_h/nhref.cu)
@@ -780,6 +803,19 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(strata-nh-vecdot-test PRIVATE strata_warnings
       ${STRATA_NH_GGML_LIBDIR}/libggml.so ${STRATA_NH_GGML_LIBDIR}/libggml-base.so ${STRATA_NH_GGML_LIBDIR}/libggml-cpu.so)
     set_target_properties(strata-nh-vecdot-test PROPERTIES CUDA_RUNTIME_LIBRARY Shared BUILD_RPATH ${STRATA_NH_GGML_LIBDIR})
+    if(STRATA_BUILD_TESTS)   # the engine's refusals before it touches the GPU (tiny files, no model)
+      set(_nh_eng ${CMAKE_COMMAND} "-DPROG=$<TARGET_FILE:strata-nh-engine>")
+      set(_nh_x ${CMAKE_CURRENT_SOURCE_DIR}/cmake/expect_exit.cmake)
+      add_test(NAME nh_engine_cli_usage COMMAND ${_nh_eng} -DEXPECT=2 "-DMATCH=usage: strata-nh-engine" -P ${_nh_x})
+      add_test(NAME nh_engine_cli_missing COMMAND ${_nh_eng} "-DARGS=--serve|--model|${_nh_fix}/tiny-missing.gguf"
+        -DEXPECT=3 "-DMATCH=GGUF layout check failed" -P ${_nh_x})
+      add_test(NAME nh_engine_cli_arch COMMAND ${_nh_eng} "-DARGS=--serve|--model|${_nh_fix}/tiny-arch.gguf"
+        -DEXPECT=1 "-DMATCH=expected 'nemotron_h_moe'" -P ${_nh_x})
+      add_test(NAME nh_engine_cli_nofile COMMAND ${_nh_eng} "-DARGS=--serve|--model|${_nh_fix}/no-such-file.gguf"
+        -DEXPECT=1 "-DMATCH=strata-nh-engine: error" -P ${_nh_x})
+      set_tests_properties(nh_engine_cli_usage nh_engine_cli_missing nh_engine_cli_arch nh_engine_cli_nofile
+        PROPERTIES FIXTURES_REQUIRED nemotron_h_fixtures)
+    endif()
   endif()
   # the engine path for the same family (serve protocol, prompt chunks, decode graph): src/qwen35/q36_engine.cu, a
   # library that `strata` switches to for a qwen35moe model (the family switch at the top of its main) and that
