@@ -754,6 +754,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_executable(strata-nh-layout src/nemotron_h/nh_layout_main.cpp)
   target_include_directories(strata-nh-layout PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata-nh-layout PRIVATE strata_warnings)
+  # the slow reference engine for the same family (all 88 layers, fp32 SGEMM over dequantised weights, routed experts
+  # paged from the mapping into a VRAM slot cache), checked against llama.cpp with the port's golden-set harness
+  add_executable(strata-nhref src/nemotron_h/nhref.cu)
+  target_include_directories(strata-nhref PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
+  target_link_libraries(strata-nhref PRIVATE strata_warnings ${_strata_gpu_runtime_target} ${_strata_gpu_blas_target})
   # the engine path for the same family (serve protocol, prompt chunks, decode graph): src/qwen35/q36_engine.cu, a
   # library that `strata` switches to for a qwen35moe model (the family switch at the top of its main) and that
   # strata-q36 wraps on its own.  Not on gfx906 (#3172, #3271): it calls cuBLAS entry points the wave64 compat layer does
