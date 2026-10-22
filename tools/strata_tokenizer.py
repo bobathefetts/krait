@@ -65,6 +65,24 @@ QWEN35_PATTERN = (
     r"|\s+"
 )
 
+# Nemotron 3.5 Super (tokenizer.ggml.pre = "tekken"): llama.cpp's ACTIVE pattern, src/llama-vocab.cpp:424-430 (b11806),
+# not the tokenizer.json original quoted there.  llama.cpp spells the case classes as lookahead-guarded [^a-z] / [^A-Z]
+# (its regex engine has no \p{Lu}/\p{Ll}); the golden token ids were produced by that version, so it is the one
+# transcribed.  The pre-type also sets ignore_merges (llama-vocab.cpp:2568-2573): a whole pre-token that is itself in
+# the vocabulary is emitted as that one id without running BPE (llama-vocab.cpp:676).
+TEKKEN_PATTERN = (
+    r"[^\r\n\p{L}\p{N}]?((?=[\p{L}\p{M}])([^a-z]))*((?=[\p{L}\p{M}])([^A-Z]))+"
+    r"|[^\r\n\p{L}\p{N}]?((?=[\p{L}\p{M}])([^a-z]))+((?=[\p{L}\p{M}])([^A-Z]))*"
+    r"|\p{N}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n/]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+
+# pre-tokenizer name -> (pattern, ignore_merges).  Anything else keeps the qwen35 pattern, as before.
+PRE_PATTERNS = {"qwen35": (QWEN35_PATTERN, False), "tekken": (TEKKEN_PATTERN, True)}
+
 
 class Tokenizer:
     def __init__(self, tokens: list[str], merges: list[str], token_types: list[int] | None = None,
@@ -88,7 +106,9 @@ class Tokenizer:
             if parts[0] not in self.ids or parts[1] not in self.ids:
                 raise ValueError("merge %d names a token outside the vocabulary: %r" % (i, m))
             self.ranks[(parts[0], parts[1])] = i
-        self._re = regex.compile(QWEN35_PATTERN)
+        pattern, self.ignore_merges = PRE_PATTERNS.get(pre, (QWEN35_PATTERN, False))
+        # findall() on a pattern with groups returns the groups; every pattern here is used for whole matches
+        self._re = regex.compile(pattern)
 
         # The literals matched directly instead of being run through BPE.  GGUF token types: 3 = CONTROL,
         # 4 = USER_DEFINED.  The two classes behave DIFFERENTLY and llama.cpp's own tokenizer settled which:
@@ -223,10 +243,18 @@ class Tokenizer:
         # A piece's ids depend on the piece alone, so repeated pieces (most of a resent conversation) are looked up
         # instead of merged again.  The ids are the ones _bpe gives: this only skips the work.
         cache = self._piece_ids
-        for piece in self._re.findall(text):
+        for m in self._re.finditer(text):
+            piece = m.group(0)
             got = cache.get(piece)
             if got is None:
                 mapped = "".join(BYTE_TO_UNICODE[b] for b in piece.encode("utf-8"))
+                whole = self.ids.get(mapped) if self.ignore_merges else None
+                if whole is not None:     # ignore_merges (llama-vocab.cpp:676)
+                    got = [whole]
+                    if len(cache) < self.PIECE_CACHE_MAX:
+                        cache[piece] = got
+                    out.extend(got)
+                    continue
                 got = []
                 for tok in self._bpe(mapped):
                     i = self.ids.get(tok)
