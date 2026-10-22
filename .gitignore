@@ -90,3 +90,6 @@ node_modules/
 docker/krait/.env
 # krait/build.sh with KRAIT_ROOT = this checkout: the fetched llama.cpp sources
 /third_party/llama.cpp-*
+# krait: scratch space and this machine's engine flags (krait/krait.local.example.json)
+_tmp/
+/krait.local.json

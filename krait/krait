@@ -1,25 +1,30 @@
 #!/usr/bin/env bash
-# krait: starts the server (OpenAI /v1/chat/completions, Anthropic /v1/messages, the web page) on Nemotron 3.5 Super
-# (ENGINE_BIN in krait/project.env).  Paths in the config are relative to KRAIT_ROOT, the directory that holds build/, models/ and pack/
-# (default: three levels above this script, the port's work directory).
-#   KRAIT_ROOT=<dir>  KRAIT_PYTHON=<python>  KRAIT_CONFIG=<json>  KRAIT_API_KEY=<key>  PORT=8095  HOST=127.0.0.1
-#   krait/krait [server options, e.g. --api-key, --help]
+# krait: starts the Krait server (OpenAI /v1/chat/completions, Anthropic /v1/messages, the web page) on Nemotron 3.5
+# Super.  Every setting is optional; krait/launch_config.py checks the install first and says what is missing.
+#   KRAIT_ROOT=<dir>      build/ (krait/build.sh), pack/ and logs/ (default: this repository)
+#   KRAIT_MODELS=<dir>    UD-Q4_K_XL/ (the 3 shards) and mmproj-BF16.gguf (default: $KRAIT_ROOT/models)
+#   KRAIT_PYTHON=<python> the server's Python (default: <repo>/.venv/bin/python3 if it exists, else python3)
+#   KRAIT_CONFIG=<json>   default krait/config.json;  KRAIT_LOCAL_CONFIG=<json> this machine's extra engine flags
+#                         (default $KRAIT_ROOT/krait.local.json if present; see krait/krait.local.example.json)
+#   KRAIT_ENGINE_ARGS="--flag value ..."  more engine flags;  KRAIT_THREADS=<n> (default: physical cores)
+#   KRAIT_API_KEY=<key>   required when HOST is not a loopback address (or KRAIT_ALLOW_OPEN=1)
+#   HOST=127.0.0.1  PORT=8095  KRAIT_IMAGE_FILES=1 / KRAIT_IMAGE_URLS=1 (images from local files / public URLs; off)
+#   KRAIT_TRACE=<file>    the engine writes every request's prompt and output token ids there (debugging only)
+#   krait/krait [server options: <python> serve/server.py --help]
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
 . "$HERE/project.env"
-KRAIT_ROOT="${KRAIT_ROOT:-$(cd "$REPO/../.." && pwd)}"
-CFG="${KRAIT_CONFIG:-$HERE/config.json}"
+KRAIT_ROOT="$(cd "${KRAIT_ROOT:-$REPO}" && pwd)"
 PY="${KRAIT_PYTHON:-}"
 if [ -z "$PY" ]; then
-  if [ -x "$KRAIT_ROOT/env/dl/bin/python3" ]; then PY="$KRAIT_ROOT/env/dl/bin/python3"; else PY=python3; fi
+  if [ -x "$REPO/.venv/bin/python3" ]; then PY="$REPO/.venv/bin/python3"; else PY=python3; fi
 fi
+mkdir -p "$KRAIT_ROOT/logs"
+RUN_CFG="$KRAIT_ROOT/logs/krait-run.json"
+"$PY" "$HERE/launch_config.py" "$REPO" "$KRAIT_ROOT" "$RUN_CFG" --host "${HOST:-127.0.0.1}" "$@"
 # the server (upstream Strata's serve/server.py) reads its key from STRATA_API_KEY
-if [ -n "${KRAIT_API_KEY+x}" ]; then export STRATA_API_KEY="$KRAIT_API_KEY"; fi
+if [ -n "${KRAIT_API_KEY:-}" ]; then export STRATA_API_KEY="$KRAIT_API_KEY"; fi
 cd "$KRAIT_ROOT"
-mkdir -p logs
-for f in "build/krait/$ENGINE_BIN" pack/nemotron/tokenizer/tokenizer.json; do
-  [ -e "$f" ] || { echo "krait: $KRAIT_ROOT/$f is missing" >&2; exit 1; }
-done
-exec "$PY" "$REPO/serve/server.py" --engine strata --config "$CFG" \
+exec "$PY" "$REPO/serve/server.py" --engine strata --config "$RUN_CFG" \
   --host "${HOST:-127.0.0.1}" --port "${PORT:-8095}" "$@"

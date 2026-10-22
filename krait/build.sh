@@ -9,13 +9,22 @@
 # The results land where krait/config.json expects them, relative to KRAIT_ROOT: build/krait/<ENGINE_BIN>,
 # build/vision/<VISION_BIN>.
 #
-#   KRAIT_ROOT=<dir>  CUDA_ARCH=120  JOBS=16  krait/build.sh [extra cmake args for the CUDA builds]
+#   KRAIT_ROOT=<dir>  CUDA_ARCH=120  JOBS=16  KRAIT_NATIVE=1  krait/build.sh [extra cmake args for the CUDA builds]
+#   KRAIT_ROOT defaults to this repository.  KRAIT_NATIVE=1 (default, the tested mode) builds ggml with GGML_NATIVE=ON
+#   (CPU code for this machine's CPU only; the binaries may not run on another CPU).  KRAIT_NATIVE=0 turns GGML_NATIVE
+#   off (ggml's generic x86-64 flags) and builds the vision encoder with STRATA_PORTABLE=ON, for an image meant to run
+#   on other machines; that mode is untested and its CPU speed is unmeasured.
 #   (cmake >= 3.21, ninja, a CUDA toolkit (nvcc on PATH or CUDACXX), gcc/g++, python3 for unpacking)
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
 . "$HERE/project.env"
-KRAIT_ROOT="${KRAIT_ROOT:-$(cd "$REPO/../.." && pwd)}"
+KRAIT_ROOT="$(mkdir -p "${KRAIT_ROOT:-$REPO}" && cd "${KRAIT_ROOT:-$REPO}" && pwd)"
+case "${KRAIT_NATIVE:-1}" in
+  1) GGML_NATIVE=ON; VISION_PORTABLE=OFF ;;
+  0) GGML_NATIVE=OFF; VISION_PORTABLE=ON ;;
+  *) echo "build.sh: KRAIT_NATIVE must be 1 or 0" >&2; exit 2 ;;
+esac
 ARCH="${CUDA_ARCH:-120}"
 JOBS="${JOBS:-$(nproc)}"
 TP="$KRAIT_ROOT/third_party"
@@ -38,7 +47,7 @@ fetch "$PIN_LLAMA_COMMIT" "$LLAMA_PIN"
 
 echo "== 1/3 ggml (llama.cpp b11806, shared, CUDA $ARCH + CPU) -> $B/ggml-nh"
 cmake -S "$LLAMA_NH" -B "$B/ggml-nh" -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DGGML_CUDA=ON \
-  -DGGML_NATIVE=ON -DCMAKE_CUDA_ARCHITECTURES="$ARCH" -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
+  -DGGML_NATIVE="$GGML_NATIVE" -DCMAKE_CUDA_ARCHITECTURES="$ARCH" -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
   -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_APP=OFF -DLLAMA_CURL=OFF "$@"
 cmake --build "$B/ggml-nh" -j "$JOBS" --target ggml ggml-base ggml-cpu ggml-cuda
 
@@ -50,10 +59,11 @@ cmake --build "$B/krait" -j "$JOBS" --target "$ENGINE_BIN" "$LAYOUT_BIN"
 
 echo "== 3/3 $VISION_BIN (CPU, llama.cpp b11806 mtmd) -> $B/vision"
 cmake -S "$REPO/tools/vision" -B "$B/vision" -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLAMA_DIR="$LLAMA_NH" \
-  -DKRAIT_PORTABLE=OFF
+  -DSTRATA_PORTABLE="$VISION_PORTABLE"
 cmake --build "$B/vision" -j "$JOBS" --target strata-vision
 # the llama.cpp subproject puts executables under bin/; install it where config.json expects it
 install -m 755 "$B/vision/bin/strata-vision" "$B/vision/$VISION_BIN"
 
 ls -l "$B/krait/$ENGINE_BIN" "$B/krait/$LAYOUT_BIN" "$B/vision/$VISION_BIN"
-echo "done: KRAIT_ROOT=$KRAIT_ROOT krait/krait (models in $KRAIT_ROOT/models, tokenizer pack in $KRAIT_ROOT/pack/nemotron)"
+echo "done. Next (README.md): the tokenizer pack (tools/strata_tokenizer.py --out $KRAIT_ROOT/pack/nemotron), then"
+echo "  KRAIT_ROOT=$KRAIT_ROOT KRAIT_MODELS=<models dir> krait/krait"

@@ -1,6 +1,6 @@
 # Krait (Nemotron 3.5 Super) + Open WebUI + a llama.cpp embedder for Open WebUI's document search (RAG).
 #
-#   cp docker/krait/env.example docker/krait/.env     # then set KRAIT_MODELS and the two keys
+#   cp docker/krait/env.example docker/krait/.env     # then set KRAIT_MODELS and the three keys
 #   docker/krait/stage.sh                                # builds krait:local from your build (krait/project.env)
 #   docker compose -f docker/krait/compose.yml up -d
 #   open http://127.0.0.1:3095 (Open WebUI; the first account made becomes the admin)
@@ -17,6 +17,7 @@ services:
       - "127.0.0.1:${KRAIT_PORT:-8095}:8095"
     environment:
       KRAIT_API_KEY: ${KRAIT_API_KEY:?set KRAIT_API_KEY in .env}
+      KRAIT_ENGINE_ARGS: ${KRAIT_ENGINE_ARGS:-}     # this machine's extra engine flags (env.example)
     volumes:
       - ${KRAIT_MODELS:?set KRAIT_MODELS in .env}:/opt/krait/models:ro
       - krait-logs:/opt/krait/logs
@@ -25,7 +26,7 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              count: all
+              count: 1
               capabilities: [gpu]
     ulimits:
       memlock: { soft: -1, hard: -1 }    # --pin page-locks the CPU-side experts
@@ -38,7 +39,7 @@ services:
       retries: 3
       start_period: 15m
   embedder:
-    image: ${EMBED_IMAGE:-ghcr.io/ggml-org/llama.cpp:server}
+    image: ${EMBED_IMAGE:-ghcr.io/ggml-org/llama.cpp:server@sha256:8c74db29f1a2bef3f0a331b52c4d6214601dfceed4bee0b94cc48b3b23ff257d}
     restart: unless-stopped
     command: ["-m", "/models/embed/nomic-embed-text-v1.5.Q8_0.gguf", "--alias", "nomic-embed-text-v1.5",
               "--embeddings", "--host", "0.0.0.0", "--port", "8080", "-c", "8192", "-b", "2048", "-ub", "2048",
@@ -48,7 +49,7 @@ services:
     volumes:
       - ${KRAIT_MODELS:?set KRAIT_MODELS in .env}:/models:ro
   open-webui:
-    image: ${WEBUI_IMAGE:-ghcr.io/open-webui/open-webui:v0.11.4}
+    image: ${WEBUI_IMAGE:-ghcr.io/open-webui/open-webui:v0.11.4@sha256:9591b13f13843c7721c2b8eaf7382846c81b3ffe126526d1888d1fed50c6a33f}
     restart: unless-stopped
     depends_on: [krait, embedder]
     ports:

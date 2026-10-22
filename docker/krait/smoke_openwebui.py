@@ -3,20 +3,23 @@
 account, lists the models, chats (plain and streaming), sends a picture, and does a document search (RAG) round trip:
 uploads a text file, waits until Open WebUI has split and embedded it (through the llama.cpp embedder), asks a
 question only that file answers, and checks the answer and the sources Open WebUI reports.
-  python3 smoke_openwebui.py [--url http://127.0.0.1:3095] [--out DIR] [--image shapes.png]"""
-import argparse, base64, json, sys, time, urllib.error, urllib.request, uuid
+  KRAIT_SMOKE_PASSWORD=<12+ chars> python3 smoke_openwebui.py [--url http://127.0.0.1:3095] [--out DIR] [--image shapes.png]"""
+import argparse, base64, json, os, sys, time, urllib.error, urllib.request, uuid
 from pathlib import Path
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--url", default="http://127.0.0.1:3095")
 ap.add_argument("--email", default="smoke@krait.local")
-ap.add_argument("--password", default="krait-smoke-test")
+ap.add_argument("--password", default=os.environ.get("KRAIT_SMOKE_PASSWORD"),
+                help="the test account's password (or KRAIT_SMOKE_PASSWORD), at least 12 characters")
 ap.add_argument("--out", default=".")
 ap.add_argument("--image", help="a picture to ask about (optional)")
 ap.add_argument("--image-question", default="What color is the circle? Answer in one word.")
 ap.add_argument("--image-expect", default="blue")
 ap.add_argument("--timeout", type=float, default=900)
 a = ap.parse_args()
+if not a.password or len(a.password) < 12:
+    sys.exit("set --password or KRAIT_SMOKE_PASSWORD (at least 12 characters): the smoke test makes a real account")
 out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
 U = a.url.rstrip("/"); token = None; log = []
 

@@ -7,7 +7,7 @@
     "--max-context",
     "32768",
     "--threads",
-    "16",
+    "auto",
     "--n-cpu-moe",
     "68",
     "--chunk",
@@ -21,8 +21,6 @@
     "1",
     "--spec-min-acc",
     "0.6",
-    "--vram-limit-mib",
-    "29346",
     "--batch",
     "4",
     "--prefix-reuse",
@@ -34,11 +32,17 @@
   "log": "logs/krait.log",
   "host": "127.0.0.1",
   "port": 8095,
+  "max_queue": 8,
+  "queue_timeout": 300,
+  "max_tokens_cap": 8192,
+  "request_timeout": 1800,
+  "image_files": false,
+  "image_urls": false,
   "vision": {
     "exe": "build/vision/krait-vision",
     "mmproj": "models/mmproj-BF16.gguf",
     "model": "models/UD-Q4_K_XL/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-UD-Q4_K_XL-00001-of-00003.gguf",
-    "threads": 16,
+    "threads": "auto",
     "flash_attn": "on"
   }
 }

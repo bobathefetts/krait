@@ -2498,6 +2498,49 @@ class StrataEngine:
 
 
 IMAGE_URL_MAX = 32 << 20        # an image URL is read up to this (the web app attaches pictures of up to 20 MB)
+# Which image sources a request may name besides data: URLs.  On by default (upstream behaviour); a config sets
+# "image_files": false / "image_urls": false (Krait's krait/config.json does both), --image-files / --image-urls
+# turn them back on.  With URLs on, a URL whose host resolves to a private, loopback, link-local or otherwise
+# non-public address is refused, and so is every redirect to one (each redirect is checked again).
+IMAGE_SOURCES = {"files": True, "urls": True}
+
+
+class RequestDeadline(threading.Event):
+    """A request's cancel event that also reads as set once its request_timeout has passed (the generation loops
+    poll is_set(); no timer thread per request)."""
+
+    def __init__(self, seconds: float | None = None):
+        super().__init__()
+        self.deadline = time.monotonic() + seconds if seconds else None
+
+    def is_set(self) -> bool:
+        return super().is_set() or (self.deadline is not None and time.monotonic() >= self.deadline)
+
+
+def public_url_host(url: str) -> None:
+    """ValueError unless url is http(s) and every address its host resolves to is a public one."""
+    import ipaddress
+    import urllib.parse
+    u = urllib.parse.urlsplit(url)
+    if u.scheme not in ("http", "https") or not u.hostname:
+        raise ValueError("an image URL must be http(s)://host/...")
+    try:
+        infos = socket.getaddrinfo(u.hostname, u.port or (443 if u.scheme == "https" else 80), proto=socket.IPPROTO_TCP)
+    except OSError as e:
+        raise ValueError(f"the image URL's host could not be resolved ({e})") from None
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0].split("%", 1)[0])
+        if getattr(ip, "ipv4_mapped", None):
+            ip = ip.ipv4_mapped
+        if not ip.is_global or ip.is_multicast:
+            raise ValueError("an image URL must point to a public address (private, loopback and link-local "
+                             "addresses are refused)")
+
+
+class _CheckedRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        public_url_host(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 def network_path(path: str) -> bool:
@@ -2689,7 +2732,13 @@ class Vision:
             except (IndexError, ValueError) as e:                # no comma, or not base64
                 raise ValueError(f"the image's data: URL could not be read ({e})") from None
         if source.startswith(("http://", "https://")):
+            if not IMAGE_SOURCES["urls"]:
+                raise ValueError("image URLs are off on this server: send the picture as a data: URL "
+                                 "(the owner can allow URLs with --image-urls / \"image_urls\": true)")
             return Vision.download(source)
+        if not IMAGE_SOURCES["files"]:
+            raise ValueError("an image must be a data: URL on this server (the owner can allow local files with "
+                             "--image-files / \"image_files\": true)")
         path = source[7:] if source.startswith("file://") else source
         # refused before anything looks at the path: file://host/share/x.png is \\host\share\x.png ("file://C:/x.png",
         # a drive, is a client's spelling of file:///C:/x.png)
@@ -2709,8 +2758,10 @@ class Vision:
         """An image URL's bytes, at most IMAGE_URL_MAX of them: the whole response was read, so a huge or endless one
         filled the memory.  One that cannot be read is a ValueError (a 400 that says so), not a dropped connection."""
         too_big = f"the image URL's file is over {IMAGE_URL_MAX >> 20} MiB"
+        public_url_host(url)
+        opener = urllib.request.build_opener(_CheckedRedirect)
         try:
-            with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "strata"}), timeout=60) as r:
+            with opener.open(urllib.request.Request(url, headers={"User-Agent": "strata"}), timeout=60) as r:
                 size = r.headers.get("Content-Length") or ""
                 if size.isdigit() and int(size) > IMAGE_URL_MAX:
                     raise ValueError(too_big)
@@ -3738,6 +3789,8 @@ class Service:
         # while a model is loading or a request is between MCP rounds; the engine's own slots remain unchanged.
         self.max_queue: int | None = None
         self.queue_timeout_s: float | None = None
+        self.max_tokens_cap: int | None = None          # "max_tokens_cap": every request's output is at most this
+        self.request_timeout_s: float | None = None     # "request_timeout": a request still running is cancelled
         self.admission_reserved = 0
         self.admission_rejected = 0
         self.queue_timeouts = 0
@@ -4003,6 +4056,10 @@ class Service:
         or the last one it reported while it restarts (max_context is 0 until READY, and a client that sizes its
         prompt from it would send nothing, #351).  Reporting only: requests are checked in prepare()."""
         return int(getattr(self.engine, "max_context", 0) or getattr(self.engine, "known_ctx", 0) or 0)
+
+    def request_cancel(self) -> threading.Event:
+        """A request's cancel event, with the server's request_timeout (if any) built in."""
+        return RequestDeadline(getattr(self, "request_timeout_s", None))
 
     def reasoning_budget(self, req) -> int | None:
         """#123: the most tokens this request may think, or None: the request's `reasoning_budget_tokens` (or, as
@@ -4763,6 +4820,9 @@ class Service:
             print(f"[strata] max_tokens {max_new} shortened to {max(1, room)}: the prompt ({len(ids)} tokens) leaves that much "
                   f"of the context ({ctx}); \"fit_max_tokens\": false answers 400 instead", flush=True)
             max_new = max(1, room)          # a shorter completion beats a 400 (the default)
+        cap = getattr(self, "max_tokens_cap", None)
+        if cap and max_new > cap:
+            max_new = cap                   # the server's cap ("max_tokens_cap"): the answer ends with "length"
         if images:
             # The request's images in one file for GENI (~10 MB a picture), written once nothing above refuses the
             # request: one refused after it (the engine starting, no room) left it in the vision directory for good,
@@ -6979,7 +7039,7 @@ def make_handler(svc: Service):
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
-            cancel = threading.Event()
+            cancel = svc.request_cancel()
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
@@ -7044,7 +7104,7 @@ def make_handler(svc: Service):
                 return self._json(e.status, e.body())
             if title is not None:
                 return self._responses_ready(req, title)
-            cancel = threading.Event()
+            cancel = svc.request_cancel()
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             try:
                 ids, thinking, tools, max_new, asm, validator, req = self._responses_prepare(req, cancel)
@@ -7215,7 +7275,7 @@ def make_handler(svc: Service):
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
-            cancel = threading.Event()
+            cancel = svc.request_cancel()
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
@@ -7983,6 +8043,11 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                     help="request this many simultaneous engine slots without changing the saved config")
     ap.add_argument("--batch-groups", default=None,
                     help="pipeline groups: auto or a positive integer, without changing the saved config")
+    ap.add_argument("--image-files", action="store_true",
+                    help="let requests name local image files (off when the config says \"image_files\": false)")
+    ap.add_argument("--image-urls", action="store_true",
+                    help="let requests name http(s) image URLs; public addresses only (off when the config says "
+                         "\"image_urls\": false)")
     ap.add_argument("--max-queue", type=int, default=None,
                     help="maximum inference calls waiting beyond effective engine slots; 0 refuses overload")
     ap.add_argument("--queue-timeout", type=float, default=None,
@@ -8078,6 +8143,19 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     except ValueError as e:
         ap.error(str(e))
     max_queue = a.max_queue if a.max_queue is not None else cfg.get("max_queue")
+    for key in ("image_files", "image_urls"):
+        if key in cfg and type(cfg[key]) is not bool:
+            ap.error(f"{key} must be true or false")
+    IMAGE_SOURCES["files"] = bool(a.image_files or cfg.get("image_files", True))
+    IMAGE_SOURCES["urls"] = bool(a.image_urls or cfg.get("image_urls", True))
+    max_tokens_cap = cfg.get("max_tokens_cap")
+    if max_tokens_cap is not None and (isinstance(max_tokens_cap, bool) or not isinstance(max_tokens_cap, int)
+                                       or not 1 <= max_tokens_cap <= 1 << 20):
+        ap.error("max_tokens_cap must be a whole number in 1..1048576")
+    request_timeout = cfg.get("request_timeout")
+    if request_timeout is not None and (isinstance(request_timeout, bool) or not isinstance(request_timeout, (int, float))
+                                        or not math.isfinite(request_timeout) or not 1 <= request_timeout <= 86400):
+        ap.error("request_timeout must be seconds in 1..86400")
     if max_queue is not None and (isinstance(max_queue, bool) or not isinstance(max_queue, int)
                                   or not 0 <= max_queue <= 4096):
         ap.error("--max-queue / max_queue must be a whole number in 0..4096")
@@ -8121,6 +8199,10 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         preflight_api_key = api_key_of(raw_key)
     except ValueError as e:
         print(f"[strata] {e}: set a key, or leave it out", file=sys.stderr)
+        return 2
+    if any(k.lower().startswith("change-me") for k in key_list(raw_key)):
+        print("[strata] the API key is still a placeholder (change-me...): set a real key "
+              "(for example: openssl rand -hex 16)", file=sys.stderr)
         return 2
     # A key is recommended on a network, never required (owner decision 2026-10-20): the banner below warns once.
     try:                                                # before the minutes of loading: is the port free?
@@ -8259,6 +8341,8 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     svc.offline = a.offline
     svc.max_queue = max_queue
     svc.queue_timeout_s = float(queue_timeout) if queue_timeout is not None else None
+    svc.max_tokens_cap = max_tokens_cap
+    svc.request_timeout_s = float(request_timeout) if request_timeout is not None else None
     if a.engine == "strata":                            # the model card's sampling when nothing else is said (see MODEL_CARD_SAMPLING)
         svc.model_arch = cfg.get("arch") or "qwen4exp"
         requested = cfg.get("parallel")

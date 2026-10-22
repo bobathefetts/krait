@@ -32,7 +32,7 @@
 // Output: the golden-set capture format of the port's bench/harness/FORMAT.md (raw form): per prompt
 // <id>.out.i32, .topk_ids.i32, .topk_logits.f32, .lse.f32, .target_lp.f32 and capture_log.txt, with the same row
 // definition, greedy rule (argmax, ties to the lowest id), EOG rule ({11 <|im_end|>, 2 </s>}: llama-vocab.cpp:3172-3202,
-// 3233; kept, not fed back) and teacher-forced mode as bench/golden/golden_tool.cpp.
+// 3233; kept, not fed back) and teacher-forced mode as the llama.cpp golden-set capture tool.
 //
 // Usage: strata-nhref --model SHARD --list capture_list.txt --tokdir DIR --out RAWDIR [--k 32] [--chunk 512]
 //                     [--ctx 32768] [--force RAWDIR] [--only id,id] [--expert-cache-mib 12000]
@@ -750,7 +750,7 @@ struct Engine {
 };
 
 // ------------------------------------------------------------------------------------------------ capture rows
-// bench/golden/golden_tool.cpp row_writer in effect: lse in double over the full vocabulary, top-K by descending
+// the golden-set capture tool's row writer in effect: lse in double over the full vocabulary, top-K by descending
 // logit with ties to the lowest id, target logprob = logit - lse.
 struct Row {
     std::vector<int32_t> ids;

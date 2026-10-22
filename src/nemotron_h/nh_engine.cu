@@ -23,9 +23,9 @@
 // writes its slot in place, so --batch N sessions only need N slots.  The serve line protocol (READY/GEN/T/DONE/STOP/
 // PP/BDONE, as src/qwen35/q36_engine.cu) sits on top of decode() (next step).
 //
-// Usage (golden-set capture, the format of bench/golden/golden_tool.cpp and nhref):
-//   strata-nh-engine --serve --model SHARD [--batch N] [--ctx 32768] ...   (serve/server.py's engine protocol, see Serve)
-//   strata-nh-engine --model SHARD --list capture_list.txt --tokdir DIR --out RAWDIR [--k 32] [--chunk 512]
+// Usage (the binary name comes from krait/project.env; golden-set capture rows in the format nhref writes):
+//   krait-engine --serve --model SHARD [--batch N] [--ctx 32768] ...   (serve/server.py's engine protocol, see Serve)
+//   krait-engine --model SHARD --list capture_list.txt --tokdir DIR --out RAWDIR [--k 32] [--chunk 512]
 //                    [--ctx 32768] [--threads 16] [--n-cpu-moe 68] [--force RAWDIR] [--only id,id]
 //                    [--dump-sums FILE --dump-prompt ID]   (every graph node: name, op, shape, sum; bisecting)
 #include "strata/artifact/gguf_reader.hpp"
@@ -89,7 +89,7 @@ std::vector<int32_t> read_i32(const std::string& p) {
     return v;
 }
 
-// ---- one output row, exactly as golden_tool.cpp row_writer (and nhref make_row) ----
+// ---- one output row, exactly as the llama.cpp golden-set capture tool writes it (and nhref make_row) ----
 struct Row {
     std::vector<int32_t> ids;
     std::vector<float> lg;
@@ -850,6 +850,7 @@ struct Engine {
     int64_t kv_len(int64_t n) const { return std::min<int64_t>(M.n_ctx, std::max<int64_t>(256, ((n + 255) / 256) * 256)); }
     int n_cpu_moe = 68;      // numerics split: experts of blocks < n_cpu_moe follow llama.cpp's CPU path
     bool pin = false;
+    long pin_reserve_mib = 8192;    // --pin: host RAM left unpinned (review-2 H3)
     long cache_mib = -1;     // -1: auto (budget from free VRAM, see init_cache)
     long vram_reserve_mib = 2048;   // review H3: VRAM left free after the expert pools
     long vram_limit_mib = 0;        // optional cap on the process's total VRAM use (0: none)
@@ -1401,7 +1402,7 @@ struct Engine {
 
     // cudaHostRegister (read-only) of the host-mapped routed experts, merged into page-aligned ranges, so expert
     // uploads (op-offload copies of prefill, cache admissions) are DMA from page-locked memory (~50+ GB/s measured vs
-    // ~20 GB/s pageable: reports/phase3/pin_test).  Stops at the first failure and keeps what is registered.
+    // ~20 GB/s pageable, measured on the development machine).  Stops at the first failure and keeps what is registered.
     void pin_experts() {
         std::vector<std::pair<uintptr_t, uintptr_t>> r;
         const uintptr_t pg = 4096;
@@ -1418,8 +1419,21 @@ struct Engine {
             if (!mr.empty() && x.first <= mr.back().second) mr.back().second = std::max(mr.back().second, x.second);
             else mr.push_back(x);
         }
+        // host RAM preflight: page-locked memory cannot be reclaimed, so pin only what leaves --pin-reserve-mib of
+        // MemAvailable (and of the cgroup's memory.max, in a container) free; the rest stays pageable
+        size_t want = 0;
+        for (auto& x : mr) want += x.second - x.first;
+        const size_t avail = host_mem_available(), reserve = (size_t) std::max(0L, pin_reserve_mib) << 20;
+        size_t budget = avail > reserve ? avail - reserve : 0;
+        budget &= ~(pg - 1);
+        if (budget < want)
+            std::fprintf(stderr, "[krait-engine] --pin: the host experts need %.0f MiB page-locked but only %.0f MiB is available "
+                                 "(%.0f MiB free to this process minus --pin-reserve-mib %ld); pinning %.0f MiB, the rest stays "
+                                 "pageable (prompt reading and cache fills get slower). Free RAM (WSL2: memory= in .wslconfig) "
+                                 "or lower --pin-reserve-mib to pin more.\n",
+                         want / 1048576.0, budget / 1048576.0, avail / 1048576.0, pin_reserve_mib, budget / 1048576.0);
         // the GGUF loader maps the shards MAP_PRIVATE; cudaHostRegister on a private file mapping does not return
-        // under WSL2 (reports/phase3/pin_priv: 1 GiB > 100 s, vs 0.035 s for MAP_SHARED).  The expert ranges are
+        // under WSL2 (measured: 1 GiB took > 100 s, vs 0.035 s for MAP_SHARED).  The expert ranges are
         // read-only and never written, so they are re-mapped MAP_SHARED|MAP_FIXED from the same file offsets (same
         // bytes, same addresses: the ggml tensors keep their data pointers).
         struct MapEnt { uintptr_t a, b; uint64_t off; std::string path; };
@@ -1440,11 +1454,13 @@ struct Engine {
             }
         }
         for (auto& x : mr) {
+            if (pinned_bytes >= budget) break;
+            if (pinned_bytes + (x.second - x.first) > budget) x.second = x.first + (budget - pinned_bytes);
             const MapEnt* me = nullptr;
             for (const MapEnt& m : maps)
                 if (x.first >= m.a && x.second <= m.b) me = &m;
             if (!me) {
-                std::fprintf(stderr, "[nh_engine] pin: range not inside one file mapping; stopping\n");
+                std::fprintf(stderr, "[krait-engine] pin: range not inside one file mapping; stopping\n");
                 break;
             }
             const int fd = open(me->path.c_str(), O_RDONLY);
@@ -1459,14 +1475,55 @@ struct Engine {
             const cudaError_t e = cudaHostRegister((void*) x.first, x.second - x.first, cudaHostRegisterReadOnly);
             if (e != cudaSuccess) {
                 cudaGetLastError();
-                std::fprintf(stderr, "[nh_engine] cudaHostRegister failed (%s) after %.1f MiB; the rest stays pageable\n",
+                std::fprintf(stderr, "[krait-engine] cudaHostRegister failed (%s) after %.1f MiB; the rest stays pageable\n",
                              cudaGetErrorString(e), pinned_bytes / 1048576.0);
                 break;
             }
             pinned_bytes += x.second - x.first;
             pinned_ranges.push_back({x.first, x.second - x.first});
         }
-        std::fprintf(stderr, "[nh_engine] page-locked %.1f MiB of host experts in %zu ranges\n", pinned_bytes / 1048576.0, mr.size());
+        std::fprintf(stderr, "[krait-engine] page-locked %.1f MiB of host experts in %zu ranges\n", pinned_bytes / 1048576.0, mr.size());
+    }
+
+    // bytes this process can still take from the host: MemAvailable, and the cgroup v2 / v1 limit minus its usage
+    static size_t host_mem_available() {
+        size_t avail = 0;
+        {
+            std::ifstream f("/proc/meminfo");
+            std::string k;
+            size_t v;
+            std::string unit;
+            while (f >> k >> v >> unit)
+                if (k == "MemAvailable:") { avail = v << 10; break; }
+        }
+        auto read_u64 = [](const char* path, size_t& out) {
+            std::ifstream f(path);
+            std::string t;
+            if (!(f >> t) || t == "max") return false;
+            char* e = nullptr;
+            const unsigned long long v = std::strtoull(t.c_str(), &e, 10);
+            if (e == t.c_str() || v >= (1ull << 60)) return false;
+            out = (size_t) v;
+            return true;
+        };
+        size_t lim = 0, cur = 0;
+        if ((read_u64("/sys/fs/cgroup/memory.max", lim) && read_u64("/sys/fs/cgroup/memory.current", cur)) ||
+            (read_u64("/sys/fs/cgroup/memory/memory.limit_in_bytes", lim) && read_u64("/sys/fs/cgroup/memory/memory.usage_in_bytes", cur)))
+            avail = std::min(avail, lim > cur ? lim - cur : 0);
+        return avail;
+    }
+
+    // without --pin: warn when the host experts do not fit in the RAM left (they are then read from disk, slowly)
+    void check_host_ram() const {
+        size_t want = 0;
+        for (const LayerW& l : W.L)
+            for (ggml_tensor* t : {l.up_exps, l.down_exps})
+                if (t && t->buffer && ggml_backend_buffer_is_host(t->buffer)) want += ggml_nbytes(t);
+        const size_t avail = host_mem_available();
+        if (want > avail)
+            std::fprintf(stderr, "[krait-engine] warning: the host-side experts are %.0f MiB but only %.0f MiB of RAM is available; "
+                                 "they will be re-read from disk and decoding will be very slow (raise --n-cpu-moe only "
+                                 "with more RAM; WSL2: memory= in .wslconfig)\n", want / 1048576.0, avail / 1048576.0);
     }
 
     // vram_limit_used: 0, or a cap on the process's total VRAM use (bytes)
@@ -1541,7 +1598,7 @@ struct Engine {
                     why = std::string("down type ") + ggml_type_name(td) + " has no CPU-exact hit kernel";
                 if (!why.empty()) {
                     if (!lo) throw std::runtime_error("nh_engine cache: layer " + std::to_string(il) + ": " + why + "; run with --cache lo or off");
-                    std::fprintf(stderr, "[nh_engine] cache: layer %d not cached (%s)\n", il, why.c_str());
+                    std::fprintf(stderr, "[krait-engine] cache: layer %d not cached (%s)\n", il, why.c_str());
                     continue;
                 }
             }
@@ -1569,8 +1626,13 @@ struct Engine {
             int cap = pp->lo ? (cap_lo > 0 ? cap_lo : cap_u) : (cap_hi > 0 ? cap_hi : cap_u);
             cap = std::min(cap, n_expert);
             if (!pp->lo && cap < C.n_used * std::max(k_snap, rows_max))
-                throw std::runtime_error("nh_engine cache: VRAM budget too small for the hi pools (need " + std::to_string(C.n_used * std::max(k_snap, rows_max)) +
-                                         " slots per layer, have " + std::to_string(cap) + "); lower --vram-reserve-mib or use --cache lo");
+                throw std::runtime_error("expert cache: the VRAM left after the dense weights, KV and state gives " + std::to_string(cap) +
+                                         " expert slots per cached layer, but each GPU-side (hi) layer needs " +
+                                         std::to_string(C.n_used * std::max(k_snap, rows_max)) + " (" + std::to_string(C.n_used) +
+                                         " experts x max(--spec-k + 1, --batch rows)). Lower --batch (or drop it) and --spec-k, "
+                                         "lower --max-context, or free VRAM (--vram-reserve-mib, --vram-limit-mib). --cache lo/off keep "
+                                         "the upper layers' experts whole on the card and need much more VRAM. Krait was measured only "
+                                         "on 32 GB cards");
             pp->cap = cap;
             pp->t_up = ggml_new_tensor_3d(C.ctx, pp->tu, C.n_in, C.n_ff, std::max(cap, 1));
             pp->t_dn = ggml_new_tensor_3d(C.ctx, pp->td, C.n_ff, C.n_in, std::max(cap, 1));
@@ -1589,7 +1651,7 @@ struct Engine {
         ggml_backend_buffer_set_usage(C.buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         C.pool_bytes = ggml_backend_buffer_get_size(C.buf);
         ggml_backend_dev_memory(ggml_backend_get_device(gpu), &fr, &tot);
-        std::fprintf(stderr, "[nh_engine] expert cache: %d lo + %d hi pools, slots/layer lo %d hi %d, %.1f MiB (budget %.1f MiB); "
+        std::fprintf(stderr, "[krait-engine] expert cache: %d lo + %d hi pools, slots/layer lo %d hi %d, %.1f MiB (budget %.1f MiB); "
                              "GPU free now %.1f MiB\n", n_lo, n_hi, cap_lo > 0 ? cap_lo : cap_u, cap_hi > 0 ? cap_hi : cap_u,
                      C.pool_bytes / 1048576.0, budget / 1048576.0, fr / 1048576.0);
     }
@@ -1639,6 +1701,7 @@ struct Engine {
             ggml_backend_buffer_clear(mtp_buf, 0);
         }
         if (pin) pin_experts();
+        else check_host_ram();
         init_memory(n_slots, n_ctx);
         ggml_backend_t backs[2] = {gpu, cpu};
         // the CPU backend computes into pinned host memory (llama-context.cpp:505-518: host buffer of the first device)
@@ -2257,7 +2320,7 @@ int sample(std::vector<float>& lg, const Sampling& s, const std::vector<int32_t>
         }
     }
     if (s.temperature <= 0.f) return argmax(lg.data(), (int) lg.size());
-    const int kk = std::max(1, std::min(s.top_k > 0 ? s.top_k : 64, (int) lg.size()));
+    const int kk = std::max(1, std::min(s.top_k > 0 ? s.top_k : (int) lg.size(), (int) lg.size()));   // top_k 0: all
     std::vector<int> idx(lg.size());
     for (size_t i = 0; i < idx.size(); ++i) idx[i] = (int) i;
     std::partial_sort(idx.begin(), idx.begin() + kk, idx.end(), [&](int a, int b) { return lg[(size_t) a] > lg[(size_t) b]; });
@@ -2339,7 +2402,7 @@ struct Serve {
         : E(e), spec(sc), chunk(ch), eog(eg), nv(e.W.g.n_vocab), slots((size_t) e.M.n_slots), sess((size_t) e.M.n_slots) {
         if (const char* v = std::getenv("STRATA_NH_READ_WINDOWS")) read_windows = std::max(0, std::min(64, std::atoi(v)));
         if (const char* v = std::getenv("KRAIT_TRACE"))
-            if (*v && !(trace = std::fopen(v, "a"))) std::fprintf(stderr, "[nh_serve] cannot open the trace file %s\n", v);
+            if (*v && !(trace = std::fopen(v, "a"))) std::fprintf(stderr, "[krait-serve] cannot open the trace file %s\n", v);
     }
     ~Serve() {
         if (trace) std::fclose(trace);
@@ -2435,7 +2498,7 @@ struct Serve {
             int32_t hdr[5];
             const size_t got = std::fread(hdr, sizeof(int32_t), 5, f);
             if (got == 0) break;
-            if (got != 5 || hdr[0] != 0x31455653 || hdr[1] < 1 || hdr[4] != (int32_t) ne) {
+            if (got != 5 || hdr[0] != 0x31455653 || hdr[1] < 1 || hdr[1] > E.M.n_ctx || hdr[4] != (int32_t) ne) {
                 ve = "bad embeddings file (expected strata-vision records of width " + std::to_string((long long) ne) + ")";
                 break;
             }
@@ -2491,7 +2554,26 @@ struct Serve {
         std::fflush(stdout);
     }
 
+    int req_slot = -1;   // the slot the request being read uses (for the recovery after an exception)
+
+    // a request that threw (not a CUDA or expert-cache error): its slot's state is dropped and the engine goes on
+    void recover(const std::string& why) {
+        if (req_slot >= 0 && req_slot < n_sess()) {
+            Slot& st = slots[(size_t) req_slot];
+            Sess& ss = sess[(size_t) req_slot];
+            if (st.active) { st.active = false; --n_active; }
+            ss.active = false;
+            ss.live.clear();
+            ss.img = false;
+            E.clear_slot(req_slot);
+        }
+        std::fprintf(stderr, "[krait-serve] request failed: %s (slot %d reset; the engine keeps running)\n", why.c_str(), req_slot);
+        err("request failed: " + why);
+        req_slot = -1;
+    }
+
     void request(const std::string& line) {
+        req_slot = -1;
         const bool adm = line[0] == 'B';
         const bool geni = line.rfind(adm ? "BGENI " : "GENI ", 0) == 0;
         if (!adm && !geni && line.rfind("GEN ", 0) != 0) {
@@ -2556,6 +2638,7 @@ struct Serve {
         }
         stop.store(false);
         const int s = adm ? slot : pick_session(ids);
+        req_slot = s;
         Sess& ss = sess[(size_t) s];
         size_t reuse = match_len(ss, ids);
         if (adm) {   // another idle session holding more of this prompt: copy its state
@@ -2648,7 +2731,7 @@ struct Serve {
             }
             std::printf("BADM %d %d\n", slot, cont ? 1 : 0);
             std::fflush(stdout);
-            std::fprintf(stderr, "[nh_serve] slot %d: prompt %zu tokens = %zu reused + %lld read in %.0f ms (%.1f tok/s)%s\n", slot,
+            std::fprintf(stderr, "[krait-serve] slot %d: prompt %zu tokens = %zu reused + %lld read in %.0f ms (%.1f tok/s)%s\n", slot,
                          ids.size(), reuse, (long long) fresh, prompt_ms, prompt_ms > 0 ? 1000.0 * (double) fresh / prompt_ms : 0.0,
                          cont ? "" : ", done at once");
             return;
@@ -2707,7 +2790,7 @@ struct Serve {
         std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu 0 0 0 0 0.0 %lld 0\n", produced, ids.size(), prompt_ms, decode_ms,
                     finish, accepted, offered, reuse, (long long) fresh);
         std::fflush(stdout);
-        std::fprintf(stderr, "[nh_serve] session %d: prompt %zu tokens = %zu reused + %lld read in %.0f ms (%.1f tok/s), %lld generated "
+        std::fprintf(stderr, "[krait-serve] session %d: prompt %zu tokens = %zu reused + %lld read in %.0f ms (%.1f tok/s), %lld generated "
                              "in %.0f ms (%.1f tok/s), drafts accepted %lld of %lld (%s)\n", s, ids.size(), reuse, (long long) fresh,
                      prompt_ms, prompt_ms > 0 ? 1000.0 * (double) fresh / prompt_ms : 0.0, produced, decode_ms,
                      decode_ms > 0 ? 1000.0 * (double) produced / decode_ms : 0.0, accepted, offered, finish);
@@ -2717,7 +2800,7 @@ struct Serve {
         std::printf("INFO engine=" NH_ENGINE_BIN " arch=nemotron_h_moe kv_slots=%d spec=%d expert_cache_mib=%.0f\n", n_sess(), spec.mode,
                     E.C.pool_bytes / 1048576.0);
         if (n_sess() > 1) std::printf("INFO batch_slots=%d slot_cache=1\n", n_sess());
-        std::fprintf(stderr, "[nh_serve] prefix reuse %s\n", prefix_reuse ? "on" : "off (every prompt is read from position 0, as the CLI does)");
+        std::fprintf(stderr, "[krait-serve] prefix reuse %s\n", prefix_reuse ? "on" : "off (every prompt is read from position 0, as the CLI does)");
         std::printf("READY %d stop\n", E.M.n_ctx);
         std::fflush(stdout);
         std::thread reader([&] {
@@ -2755,13 +2838,19 @@ struct Serve {
                 if (b >= 0 && b < (int) slots.size()) slots[(size_t) b].stop = true;
             } else if (line.rfind("BYIELD", 0) == 0) {
             } else if (line.rfind("GEN", 0) == 0 || line.rfind("BGEN", 0) == 0) {
-                request(line);
+                try {
+                    request(line);
+                } catch (const std::exception& ex) {
+                    // a CUDA or expert-cache error leaves the device state unknown: those still end the process
+                    if (E.C.err.load() || cudaPeekAtLastError() != cudaSuccess) throw;
+                    recover(ex.what());
+                }
             } else {
                 err("expected: GEN <max_new> [key=value ...] <id,id,...>");
             }
             if (n_active > 0) window();
         }
-        std::fprintf(stderr, "[nh_serve] input closed; %lld batch windows (%lld rows, %.1f s)\n", windows, window_rows, window_s);
+        std::fprintf(stderr, "[krait-serve] input closed; %lld batch windows (%lld rows, %.1f s)\n", windows, window_rows, window_s);
         E.cache_stats(stderr);
         return 0;
     }
@@ -2782,6 +2871,7 @@ int real_main(int argc, char** argv) {
     std::string model, list, tokdir, outdir, force, only, dump_sums, dump_prompt, bench, bench_out;
     int profile = 0;
     bool pin = false;
+    long pin_reserve_mib = 8192;    // --pin: host RAM left unpinned (review-2 H3)
     int cache_mode = 0, cap_lo = 0, cap_hi = 0, max_admit = 2;
     long cache_mib = -1, vram_reserve_mib = 2048, vram_limit_mib = 0;
     double cache_decay = 0.97;
@@ -2833,6 +2923,7 @@ int real_main(int argc, char** argv) {
         }
         else if (a == "--cache-mib") cache_mib = std::stol(nx());
         else if (a == "--vram-reserve-mib") vram_reserve_mib = std::stol(nx());
+        else if (a == "--pin-reserve-mib") pin_reserve_mib = std::stol(nx());
         else if (a == "--vram-limit-mib") vram_limit_mib = std::stol(nx());
         else if (a == "--cap-lo") cap_lo = std::stoi(nx());
         else if (a == "--cap-hi") cap_hi = std::stoi(nx());
@@ -2853,7 +2944,7 @@ int real_main(int argc, char** argv) {
             // server.py passes the config's args plus a few of its own: one this engine does not have is said and
             // skipped (with its value), not fatal (as q36_engine.cu)
             const bool val = i + 1 < argc && std::string(argv[i + 1]).rfind("--", 0) != 0;
-            std::fprintf(stderr, "[nh_engine] ignoring %s%s%s (not an option of this engine)\n", a.c_str(), val ? " " : "", val ? argv[i + 1] : "");
+            std::fprintf(stderr, "[krait-engine] ignoring %s%s%s (not an option of this engine)\n", a.c_str(), val ? " " : "", val ? argv[i + 1] : "");
             if (val) ++i;
         } else {
             std::fprintf(stderr, "unknown argument %s\n", a.c_str());
@@ -2865,7 +2956,7 @@ int real_main(int argc, char** argv) {
                              "[--chunk 512] [--ctx 32768] [--threads 16] [--n-cpu-moe 68] [--force RAWDIR] [--only ids] "
                              "[--dump-sums FILE --dump-prompt ID]\n       " NH_ENGINE_BIN " --model SHARD --bench FILE --bench-out JSONL "
                              "[--profile NTOK] [--chunk 512] [--ctx 32768] [--threads 16] [--n-cpu-moe 68]\n"
-                             "       either: [--pin] [--cache lo|all|off] [--cache-mib N] [--cap-lo N] [--cap-hi N] "
+                             "       either: [--pin] [--pin-reserve-mib 8192] [--cache lo|all|off] [--cache-mib N] [--cap-lo N] [--cap-hi N] "
                              "[--cache-decay 0.97] [--max-admit 2] [--vram-reserve-mib 2048] [--vram-limit-mib N]\n"
                              "       [--spec off|ngram|mtp|auto] [--spec-k 1..3] [--spec-min-acc X] [--mtp-topk N] [--spec-check]\n"
                              "       " NH_ENGINE_BIN " --serve --model SHARD [--batch 2..4] [--ctx N] [the cache/spec options]\n");
@@ -2878,13 +2969,14 @@ int real_main(int argc, char** argv) {
     if (!m.report.pass()) {
         // review H1: a GGUF whose tensors do not match the expected layout (missing, wrong shape/type, payload outside
         // the file) is refused before anything reads it
-        for (const auto& e : m.report.errors) std::fprintf(stderr, "[nh_engine] layout: %s\n", e.c_str());
-        std::fprintf(stderr, "[nh_engine] GGUF layout check failed (%d expected, %d found, %d ok, %d in file); refusing to run\n",
+        for (const auto& e : m.report.errors) std::fprintf(stderr, "[krait-engine] layout: %s\n", e.c_str());
+        std::fprintf(stderr, "[krait-engine] GGUF layout check failed (%d expected, %d found, %d ok, %d in file); refusing to run\n",
                      m.report.expected, m.report.found, m.report.ok, m.report.in_file);
         return 3;
     }
     Engine E;
     E.pin = pin;
+    E.pin_reserve_mib = pin_reserve_mib;
     E.cache_mib = cache_mib;
     E.vram_reserve_mib = vram_reserve_mib;
     E.vram_limit_mib = vram_limit_mib;
@@ -2904,7 +2996,7 @@ int real_main(int argc, char** argv) {
     {
         size_t fr = 0, tot = 0;
         ggml_backend_dev_memory(ggml_backend_get_device(E.gpu), &fr, &tot);
-        std::fprintf(stderr, "[nh_engine] loaded in %.1f s; weights VRAM %.1f MiB, host-mapped %.1f MiB (%d tensors, "
+        std::fprintf(stderr, "[krait-engine] loaded in %.1f s; weights VRAM %.1f MiB, host-mapped %.1f MiB (%d tensors, "
                              "experts of blocks < %d); state %.1f MiB; GPU free %.1f MiB of %.1f\n",
                      now_s() - t_load0, E.W.gpu_bytes / 1048576.0, E.W.cpu_bytes / 1048576.0, E.W.n_cpu_tensors, n_cpu_moe,
                      ggml_backend_buffer_get_size(E.M.buf) / 1048576.0, fr / 1048576.0, tot / 1048576.0);
@@ -3159,7 +3251,7 @@ int real_main(int argc, char** argv) {
         std::fprintf(sumf, "%s n_prompt=%d n_out=%zu rows=%zu eog=%d prompt_s=%.3f gen_s=%.3f\n", id.c_str(), np,
                      out.size(), rows.size(), is_eog ? 1 : 0, t1 - t0, t2 - t1);
         std::fflush(sumf);
-        std::fprintf(stderr, "[nh_engine] %s n_prompt=%d n_out=%zu eog=%d prompt_s=%.1f gen_s=%.1f\n", id.c_str(), np,
+        std::fprintf(stderr, "[krait-engine] %s n_prompt=%d n_out=%zu eog=%d prompt_s=%.1f gen_s=%.1f\n", id.c_str(), np,
                      out.size(), is_eog ? 1 : 0, t1 - t0, t2 - t1);
     }
     std::fclose(sumf);

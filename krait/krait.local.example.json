@@ -1,0 +1,4 @@
+{
+  "_comment": "Copy to $KRAIT_ROOT/krait.local.json (git ignores it) for engine flags that belong to one machine. This example caps the engine's VRAM at 29,346 MiB, the cap used for every published measurement (a 32 GB card that also drives a desktop). Without a cap the engine uses the free VRAM minus --vram-reserve-mib (2048).",
+  "engine_args": ["--vram-limit-mib", "29346"]
+}

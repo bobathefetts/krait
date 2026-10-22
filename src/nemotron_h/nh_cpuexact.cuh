@@ -259,7 +259,7 @@ __global__ void k_relu2_q8_0(const float* in, int n, uint8_t* out) {
     q = q < -128 ? -128 : (q > 127 ? 127 : q);
     uint8_t* b = out + ((size_t) e * nblk + blk) * Q80_BYTES;
     // fp16 d from lanes 0/1 (one byte each).  Writing both d bytes from lane 0 after a __syncwarp() lost the low byte
-    // with nvcc 12.9 / sm_120 (bench/phase3 dbg q80dbg3.cu: variant 0 wrong, this variant right)
+    // with nvcc 12.9 / sm_120 (a standalone repro: variant 0 wrong, this variant right)
     const unsigned int raw = (unsigned int) __half_as_ushort(__float2half_rn(d));
     if (lane < 2) b[lane] = (uint8_t) (raw >> (8 * lane));
     b[2 + lane] = (uint8_t) (int8_t) q;

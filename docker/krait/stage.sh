@@ -3,15 +3,19 @@
 # the shared libraries they load (as ldd resolves them here; libcuda comes from the NVIDIA container runtime), the
 # server's Python sources and the tokenizer pack into a build context, then runs docker build.  The model is not in
 # the image: compose.yml mounts it.
-#   KRAIT_ROOT=<dir with build/ and pack/>  docker/krait/stage.sh [context dir]
+#   KRAIT_ROOT=<dir with build/ and pack/, default this repository>  docker/krait/stage.sh
+#   The build context goes to a fresh temporary directory (KRAIT_STAGE_DIR=<dir> to choose its parent) and is removed
+#   after docker build; KRAIT_KEEP_CONTEXT=1 keeps it.  The image runs the binaries of your build: with the default
+#   KRAIT_NATIVE=1 build they are tuned for this machine's CPU (see krait/build.sh for KRAIT_NATIVE=0).
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
-KRAIT_ROOT="${KRAIT_ROOT:-$(cd "$REPO/../.." && pwd)}"
+KRAIT_ROOT="$(cd "${KRAIT_ROOT:-$REPO}" && pwd)"
 . "$REPO/krait/project.env"
-CTX="${1:-$KRAIT_ROOT/_tmp/docker-krait}"
 TAG="${KRAIT_IMAGE:-$PROJECT_SLUG:local}"
-if [ -e "$CTX" ]; then mv "$CTX" "$CTX.old.$(date +%Y%m%d-%H%M%S)"; fi   # never deleted; old contexts can be removed by hand
+if [ -n "${KRAIT_STAGE_DIR:-}" ]; then mkdir -p "$KRAIT_STAGE_DIR"; fi
+CTX="$(mktemp -d "${KRAIT_STAGE_DIR:-${TMPDIR:-/tmp}}/krait-stage.XXXXXX")"
+if [ "${KRAIT_KEEP_CONTEXT:-0}" != 1 ]; then trap 'rm -rf -- "$CTX"' EXIT; else echo "stage: context kept in $CTX"; fi
 O="$CTX/opt/krait"
 mkdir -p "$O/libexec" "$O/lib/engine" "$O/lib/vision" "$O/build/krait" "$O/build/vision" "$O/pack/nemotron" "$O/src/krait" "$O/logs"
 copy_libs() {  # $1 binary, $2 destination: every resolved library except glibc's and the driver's
