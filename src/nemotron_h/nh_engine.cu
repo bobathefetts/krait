@@ -313,6 +313,51 @@ bool dump_cb(ggml_tensor* t, bool ask, void* ud) {
     return true;
 }
 
+// ---- Phase 4 debugging: per-node, per-token hashes of every named F32 node, plain T == 1 steps vs one verify batch ----
+struct DiffCtx {
+    int mode = 0;   // 1 plain step (record one row per node), 2 verify batch (split each node into T token rows)
+    int T = 1;
+    std::map<std::string, std::vector<uint64_t>> P, V;
+    std::map<std::string, std::string> shape_p, shape_v;
+    std::vector<std::string> order;
+    std::set<std::string> seen;   // names already met in the current graph
+    std::vector<uint8_t> tmp;
+};
+
+static uint64_t fnv(const uint8_t* b, size_t n) {
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < n; ++i) h = (h ^ b[i]) * 1099511628211ull;
+    return h;
+}
+
+bool diff_cb(ggml_tensor* t, bool ask, void* ud) {
+    DiffCtx& d = *static_cast<DiffCtx*>(ud);
+    if (ask) return t->name[0] != 0;
+    if (t->type != GGML_TYPE_F32 || ggml_is_empty(t) || !ggml_is_contiguous(t) || t->name[0] == 0) return true;
+    std::string nm = t->name;
+    while (d.seen.count(nm)) nm += "#";
+    d.seen.insert(nm);
+    const size_t nb = ggml_nbytes(t);
+    d.tmp.resize(nb);
+    ggml_backend_tensor_get(t, d.tmp.data(), 0, nb);
+    char shp[96];
+    std::snprintf(shp, sizeof shp, "%lld,%lld,%lld,%lld", (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2],
+                  (long long) t->ne[3]);
+    if (d.mode == 1) {
+        if (!d.P.count(nm)) d.order.push_back(nm);
+        d.P[nm].push_back(fnv(d.tmp.data(), nb));
+        d.shape_p[nm] = shp;
+    } else if (d.mode == 2) {
+        d.shape_v[nm] = shp;
+        auto& v = d.V[nm];
+        v.clear();
+        if (nb % (size_t) d.T) return true;
+        const size_t n = nb / (size_t) d.T;
+        for (int i = 0; i < d.T; ++i) v.push_back(fnv(d.tmp.data() + (size_t) i * n, n));
+    }
+    return true;
+}
+
 // ---- Phase 3: the routed-expert cache (decode, T == 1) ----
 // Every MoE layer gets a VRAM slot pool with an expert -> slot map and LFU-with-decay scores.
 //  * blocks < n_cpu_moe ("lo"): llama.cpp computes their experts on the CPU (ggml-cpu vec_dot) at T < 32.  Here three
@@ -687,6 +732,7 @@ struct Engine {
     ggml_backend_sched_t sched = nullptr;
     CopyExperts cx;
     DumpCtx dump;
+    DiffCtx diff;
     ProfCtx prof;
     CacheCtx C;
     // speculative decoding: verify batches (T <= NH_TMAX tokens computed with T == 1 numerics), rollback snapshots
@@ -931,7 +977,17 @@ struct Engine {
         const nh::Geometry& g = W.g;
         ggml_tensor* inp_emb = cur;
         ggml_tensor* inp_latent = ggml_mul_mat(ctx0, l.latent_down, cur);
-        ggml_tensor* router_logits = ggml_mul_mat(ctx0, l.gate_inp, cur);
+        ggml_tensor* router_logits = nullptr;
+        if (verify && cur->ne[1] > 3) {
+            // F32 router: MMVF serves ne11 <= 3 on sm_120 (mmvf.cu ggml_cuda_should_use_mmvf); keep T == 1 numerics per token
+            for (int64_t t = 0; t < cur->ne[1]; ++t) {
+                ggml_tensor* ct = ggml_view_2d(ctx0, cur, cur->ne[0], 1, cur->nb[1], (size_t) t * cur->nb[1]);
+                ggml_tensor* lt = ggml_mul_mat(ctx0, l.gate_inp, ct);
+                router_logits = router_logits ? ggml_concat(ctx0, router_logits, lt, 1) : lt;
+            }
+        } else {
+            router_logits = ggml_mul_mat(ctx0, l.gate_inp, cur);
+        }
         ggml_format_name(router_logits, "ffn_moe_logits-%d", il);
         const int64_t n_expert = l.up_exps->ne[2], n_used = g.n_expert_used;
         const int64_t n_embd = inp_latent->ne[0], n_tokens = inp_latent->ne[1];
@@ -1344,6 +1400,9 @@ struct Engine {
         if (prof.on) {
             prof.sched = sched;
             ggml_backend_sched_set_eval_callback(sched, prof_cb, &prof);
+        } else if (diff.mode) {
+            diff.seen.clear();
+            ggml_backend_sched_set_eval_callback(sched, diff_cb, &diff);
         } else {
             ggml_backend_sched_set_eval_callback(sched, dump.f ? dump_cb : nullptr, &dump);
         }
@@ -1416,6 +1475,8 @@ struct SpecStats {
     long src_drafted[3] = {0, 0, 0}, src_accepted[3] = {0, 0, 0}, src_steps[3] = {0, 0, 0};   // 0 ngram, 1 mtp, 2 mixed
     std::map<int, long> acc_hist;   // accepted drafts per verify step
     double t_draft = 0, t_verify = 0, t_plain = 0, t_commit = 0;
+    double t_by_T[NH_TMAX + 1] = {};
+    long n_by_T[NH_TMAX + 1] = {};
 };
 
 // most recent earlier occurrence of the last n context tokens (n = nmax .. nmin), and up to k tokens that followed it
@@ -1472,6 +1533,8 @@ void spec_generate(Engine& E, const SpecCfg& cfg, SpecStats& st, std::vector<int
             std::memcpy(last.data(), E.logits.data(), sizeof(float) * (size_t) nv);
             st.plain_steps++;
             st.t_plain += now_s() - t0;
+            st.t_by_T[1] += now_s() - t0;
+            st.n_by_T[1]++;
             continue;
         }
         std::vector<int32_t> toks{x};
@@ -1480,6 +1543,8 @@ void spec_generate(Engine& E, const SpecCfg& cfg, SpecStats& st, std::vector<int
         const double t0 = now_s();
         E.decode(toks.data(), T, 0, true, true);
         st.t_verify += now_s() - t0;
+        st.t_by_T[T] += now_s() - t0;
+        st.n_by_T[T]++;
         st.steps++;
         st.drafted += T - 1;
         st.src_drafted[0] += T - 1;
@@ -1521,6 +1586,8 @@ void print_spec_stats(const SpecStats& st, FILE* f) {
             std::fprintf(f, "[spec] source %s: steps %ld drafted %ld accepted %ld rate %.4f\n", nm[s], st.src_steps[s], st.src_drafted[s],
                          st.src_accepted[s], st.src_drafted[s] ? (double) st.src_accepted[s] / (double) st.src_drafted[s] : 0.0);
     for (auto& kv : st.acc_hist) std::fprintf(f, "[spec] accepted %d: %ld steps\n", kv.first, kv.second);
+    for (int T = 1; T <= NH_TMAX; ++T)
+        if (st.n_by_T[T]) std::fprintf(f, "[spec] decode T=%d: %ld steps, mean %.3f ms\n", T, st.n_by_T[T], 1e3 * st.t_by_T[T] / (double) st.n_by_T[T]);
 }
 
 std::set<std::string> split_ids(const std::string& s) {
@@ -1543,6 +1610,7 @@ int main(int argc, char** argv) {
     double cache_decay = 0.97;
     SpecCfg spec;
     bool spec_check = false;
+    int spec_diff = 0;
     int K = 32, chunk = 512, ctx = 32768, threads = 16, n_cpu_moe = 68;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -1584,6 +1652,7 @@ int main(int argc, char** argv) {
         }
         else if (a == "--spec-k") spec.k = std::stoi(nx());
         else if (a == "--spec-check") spec_check = true;
+        else if (a == "--spec-diff") spec_diff = std::stoi(nx());
         else {
             std::fprintf(stderr, "unknown argument %s\n", a.c_str());
             return 2;
@@ -1636,6 +1705,53 @@ int main(int argc, char** argv) {
         while (bf >> name >> npred >> igeos >> reps >> ntok) {
             std::vector<int32_t> pt((size_t) ntok);
             for (int i = 0; i < ntok; ++i) bf >> pt[(size_t) i];
+            if (spec_diff > 0) {
+                // T plain steps (greedy chain) vs one verify batch of the same T tokens, node by node
+                const int T = spec_diff;
+                E.clear_slot(0);
+                for (int off = 0; off < ntok; off += chunk) E.decode(pt.data() + off, std::min(chunk, ntok - off), 0, false);
+                std::vector<int32_t> xs{argmax(E.logits.data(), nv)};
+                std::vector<std::vector<float>> plain_logits;
+                E.diff.mode = 1;
+                for (int t = 0; t < T; ++t) {
+                    E.decode(&xs.back(), 1, 0, false);
+                    plain_logits.emplace_back(E.logits.begin(), E.logits.begin() + nv);
+                    if (t + 1 < T) xs.push_back(argmax(E.logits.data(), nv));
+                }
+                E.diff.mode = 0;
+                E.clear_slot(0);
+                for (int off = 0; off < ntok; off += chunk) E.decode(pt.data() + off, std::min(chunk, ntok - off), 0, false);
+                E.diff.mode = 2;
+                E.diff.T = T;
+                E.decode(xs.data(), T, 0, true, true);
+                E.diff.mode = 0;
+                int n_cmp = 0, n_bad = 0;
+                for (const auto& nm : E.diff.order) {
+                    const auto& p = E.diff.P[nm];
+                    auto it = E.diff.V.find(nm);
+                    if (it == E.diff.V.end() || it->second.size() != (size_t) T || p.size() != (size_t) T) {
+                        std::fprintf(stderr, "[spec-diff] %-34s plain %s x%zu, verify %s: not comparable\n", nm.c_str(),
+                                     E.diff.shape_p[nm].c_str(), p.size(), it == E.diff.V.end() ? "-" : E.diff.shape_v[nm].c_str());
+                        continue;
+                    }
+                    n_cmp++;
+                    std::string bad;
+                    for (int t = 0; t < T; ++t)
+                        if (p[(size_t) t] != it->second[(size_t) t]) bad += " t" + std::to_string(t);
+                    if (!bad.empty()) {
+                        n_bad++;
+                        if (n_bad <= 60)
+                            std::fprintf(stderr, "[spec-diff] %-34s plain %s verify %s MISMATCH%s\n", nm.c_str(), E.diff.shape_p[nm].c_str(),
+                                         E.diff.shape_v[nm].c_str(), bad.c_str());
+                    }
+                }
+                int lbad = 0;
+                for (int t = 0; t < T; ++t)
+                    if (std::memcmp(plain_logits[(size_t) t].data(), E.logits.data() + (size_t) t * nv, sizeof(float) * (size_t) nv)) lbad++;
+                std::fprintf(stderr, "[spec-diff] T=%d: %d named nodes compared, %d mismatching; logits rows differing %d/%d; "
+                                     "verify-only nodes %zu\n", T, n_cmp, n_bad, lbad, T, E.diff.V.size() - (size_t) n_cmp);
+                return lbad ? 1 : 0;
+            }
             for (int rep = 0; rep < reps; ++rep) {
                 E.clear_slot(0);
                 const double t0 = now_s();
