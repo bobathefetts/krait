@@ -24,6 +24,7 @@
 // PP/BDONE, as src/qwen35/q36_engine.cu) sits on top of decode() (next step).
 //
 // Usage (golden-set capture, the format of bench/golden/golden_tool.cpp and nhref):
+//   strata-nh-engine --serve --model SHARD [--batch N] [--ctx 32768] ...   (serve/server.py's engine protocol, see Serve)
 //   strata-nh-engine --model SHARD --list capture_list.txt --tokdir DIR --out RAWDIR [--k 32] [--chunk 512]
 //                    [--ctx 32768] [--threads 16] [--n-cpu-moe 68] [--force RAWDIR] [--only id,id]
 //                    [--dump-sums FILE --dump-prompt ID]   (every graph node: name, op, shape, sum; bisecting)
@@ -56,6 +57,11 @@
 #include <fstream>
 #include <functional>
 #include <map>
+#include <mutex>
+#include <condition_variable>
+#include <deque>
+#include <iostream>
+#include <random>
 #include <cctype>
 #include <set>
 #include <sstream>
@@ -326,6 +332,7 @@ struct GraphIn {
     ggml_tensor *tokens = nullptr, *s_copy = nullptr, *s_copy_main = nullptr, *s_copy_tail = nullptr;
     ggml_tensor *k_idxs = nullptr, *v_idxs = nullptr, *kq_mask = nullptr, *out_ids = nullptr, *logits = nullptr;
     ggml_tensor* h = nullptr;   // result_norm rows (the MTP head's input), when requested
+    std::vector<ggml_tensor*> s_copy_r;   // rows mode: the recurrent-state index (slot) of each row
 };
 
 struct DumpCtx {
@@ -820,6 +827,13 @@ struct Engine {
     // speculative decoding: verify batches (T <= NH_TMAX tokens computed with T == 1 numerics), rollback snapshots
     bool verify = false, want_h = false;
     int64_t vpos0 = 0;
+    // rows mode (--batch decode windows): T rows, row r = the next token of session row_slot[r] at position row_pos[r];
+    // every row is computed as that session's own T == 1 step computes it (per-row Mamba-2 state and attention, the
+    // verify paths of the MoE), so a batched answer is token-for-token the answer of the request alone
+    bool rows_mode = false;
+    int rows_max = 1;               // most rows a window can have (the batch slots)
+    std::vector<int> row_slot;
+    std::vector<int64_t> row_pos;
     int k_snap = 1;                 // recurrent-state rows per slot: 1 + rollback snapshots
     std::vector<float> hrows;       // result_norm rows of the last decode (want_h)
     // MTP draft head
@@ -840,7 +854,7 @@ struct Engine {
     size_t pinned_bytes = 0;
     int n_threads = 16;
     bool force_norm = true;   // llama-context.cpp graph_get_cb: "norm" pinned to the layer's device (full offload)
-    int max_nodes = 16384;
+    int max_nodes = 32768;
     std::vector<uint8_t> meta;
     std::vector<float> logits;   // host, [n_out][n_vocab]
     ggml_context* ctx0 = nullptr;
@@ -919,6 +933,7 @@ struct Engine {
         const nh::Geometry& g = W.g;
         const int64_t d_conv = g.ssm_d_conv, d_inner = g.ssm_d_inner, d_state = g.ssm_d_state, n_head = g.ssm_n_head;
         const int64_t head_dim = d_inner / n_head, n_group = g.ssm_n_group;
+        if (rows_mode) return build_mamba2_rows(cur, il, T, gi);
         const int64_t n_seqs = 1, n_seq_tokens = T, K = verify ? T : 1;   // verify: T rollback snapshots
         const int64_t mem_size = M.n_slots, kv_head = slot, n_rs = 1;
         ggml_tensor* conv_states_all = M.r[(size_t) il];
@@ -990,6 +1005,89 @@ struct Engine {
         return cur;
     }
 
+    // rows mode: ssm_in / ssm_out / the group norm over all rows at once (row-wise ops: MMVQ for ncols <= 4 and the
+    // norms reduce each row on its own), the recurrent part (conv state, ssm_conv, ssm_scan, D, gate) per row on its own
+    // slot's state, built exactly as build_mamba2 builds a T == 1 step
+    ggml_tensor* build_mamba2_rows(ggml_tensor* cur, int il, int64_t T, GraphIn& gi) {
+        const LayerW& l = W.L[(size_t) il];
+        const nh::Geometry& g = W.g;
+        const int64_t d_conv = g.ssm_d_conv, d_inner = g.ssm_d_inner, d_state = g.ssm_d_state, n_head = g.ssm_n_head;
+        const int64_t head_dim = d_inner / n_head, n_group = g.ssm_n_group;
+        const int64_t n_seqs = 1, n_seq_tokens = 1, K = 1;
+        const int64_t mem_size = M.n_slots, n_rs = 1;
+        ggml_tensor* conv_states_all = M.r[(size_t) il];
+        ggml_tensor* ssm_states_all = M.s[(size_t) il];
+        const int64_t state_slots = ssm_states_all->ne[1];
+        ggml_tensor* zx_all = ggml_mul_mat(ctx0, l.ssm_in, cur);
+        ggml_tensor* yall = nullptr;
+        for (int64_t r = 0; r < T; ++r) {
+            const int64_t kv_head = row_slot[(size_t) r];
+            ggml_tensor* sc = gi.s_copy_r[(size_t) r];
+            ggml_tensor* sc_main = ggml_view_1d(ctx0, sc, n_seqs, 0);
+            ggml_tensor* sc_tail = ggml_view_1d(ctx0, sc, n_rs - 1, sc->nb[0]);
+            ggml_tensor* conv = build_rs(conv_states_all, sc, sc_main, n_embd_r(), n_seqs, n_rs, kv_head, -1, nullptr);
+            conv = ggml_reshape_3d(ctx0, conv, d_conv - 1, d_inner + 2 * n_group * d_state, n_seqs);
+            ggml_tensor* zxBCdt = ggml_view_3d(ctx0, zx_all, zx_all->ne[0], n_seq_tokens, n_seqs, zx_all->nb[1], zx_all->nb[1],
+                                               (size_t) r * zx_all->nb[1]);
+            ggml_tensor* z = ggml_view_4d(ctx0, zxBCdt, head_dim, n_head, n_seq_tokens, n_seqs, head_dim * zxBCdt->nb[0],
+                                          zxBCdt->nb[1], zxBCdt->nb[2], 0);
+            ggml_tensor* xBC = ggml_view_3d(ctx0, zxBCdt, d_inner + 2 * n_group * d_state, n_seq_tokens, n_seqs,
+                                            zxBCdt->nb[1], zxBCdt->nb[2], d_inner * ggml_element_size(zxBCdt));
+            ggml_tensor* dt = ggml_view_3d(ctx0, zxBCdt, n_head, n_seq_tokens, n_seqs, zxBCdt->nb[1], zxBCdt->nb[2],
+                                           (2 * d_inner + 2 * n_group * d_state) * ggml_element_size(zxBCdt));
+            {
+                ggml_tensor* conv_x = ggml_concat(ctx0, conv, ggml_transpose(ctx0, xBC), 0);
+                const int64_t row_count = (d_conv - 1) * (d_inner + 2 * n_group * d_state);
+                const size_t row_size = ggml_row_size(conv_states_all->type, row_count);
+                ggml_tensor* last_conv = ggml_view_3d(ctx0, conv_x, d_conv - 1, d_inner + 2 * n_group * d_state, n_seqs,
+                                                      conv_x->nb[1], conv_x->nb[2], n_seq_tokens * conv_x->nb[0]);
+                ggml_build_forward_expand(
+                    gf, ggml_cpy(ctx0, last_conv,
+                                 ggml_view_2d(ctx0, conv_states_all, row_count, n_seqs, conv_states_all->nb[1],
+                                              (size_t) kv_head * row_size)));
+                xBC = ggml_ssm_conv(ctx0, conv_x, l.ssm_conv1d);
+                xBC = ggml_add(ctx0, xBC, l.ssm_conv1d_b);
+                xBC = ggml_silu(ctx0, xBC);
+            }
+            ggml_tensor* x = ggml_view_4d(ctx0, xBC, head_dim, n_head, n_seq_tokens, n_seqs, head_dim * xBC->nb[0],
+                                          xBC->nb[1], xBC->nb[2], 0);
+            ggml_tensor* B = ggml_view_4d(ctx0, xBC, d_state, n_group, n_seq_tokens, n_seqs, d_state * xBC->nb[0],
+                                          xBC->nb[1], xBC->nb[2], d_inner * ggml_element_size(xBC));
+            ggml_tensor* C_ = ggml_view_4d(ctx0, xBC, d_state, n_group, n_seq_tokens, n_seqs, d_state * xBC->nb[0],
+                                           xBC->nb[1], xBC->nb[2], (d_inner + n_group * d_state) * ggml_element_size(xBC));
+            dt = ggml_add(ctx0, ggml_cont(ctx0, dt), l.ssm_dt_b);
+            ggml_tensor* A = l.ssm_a;
+            auto get_ssm_rows = [&](ggml_context* ctx, ggml_tensor* states, ggml_tensor* ids) {
+                ggml_tensor* ssm = ggml_reshape_4d(ctx, states, d_state, head_dim, n_head, state_slots);
+                return ggml_ssm_scan(ctx, ssm, x, dt, A, B, C_, ids, K);
+            };
+            ggml_tensor* y_ssm = build_rs(ssm_states_all, sc_tail, sc_main, n_embd_s(), n_seqs, n_rs, kv_head, -1, get_ssm_rows);
+            {
+                const int64_t D = d_state * d_inner;
+                const size_t row_size = ggml_row_size(ssm_states_all->type, D);
+                const size_t y_row_size = ggml_row_size(y_ssm->type, D);
+                const size_t state_offset = ggml_nelements(x) * ggml_element_size(x);
+                ggml_build_forward_expand(
+                    gf, ggml_cpy(ctx0, ggml_view_3d(ctx0, y_ssm, D, n_seqs, 1, y_row_size, y_row_size * n_seqs, state_offset),
+                                 ggml_view_3d(ctx0, ssm_states_all, D, n_seqs, 1, ssm_states_all->nb[1],
+                                              (size_t) mem_size * row_size, kv_head * row_size)));
+            }
+            ggml_tensor* y = ggml_view_4d(ctx0, y_ssm, head_dim, n_head, n_seq_tokens, n_seqs, x->nb[1], n_head * x->nb[1],
+                                          n_seq_tokens * n_head * x->nb[1], 0);
+            y = ggml_add(ctx0, y, ggml_mul(ctx0, x, l.ssm_d));
+            y = ggml_swiglu_split(ctx0, ggml_cont(ctx0, z), y);
+            y = ggml_reshape_2d(ctx0, y, d_inner, 1);
+            yall = r == 0 ? y : ggml_concat(ctx0, yall, y, 1);
+        }
+        ggml_format_name(yall, "mamba2_rows_y-%d", il);
+        ggml_tensor* y = ggml_reshape_4d(ctx0, yall, d_inner / n_group, n_group, T, 1);
+        y = build_norm(y, l.ssm_norm, il);
+        y = ggml_reshape_2d(ctx0, y, d_inner, T);
+        cur = ggml_mul_mat(ctx0, l.ssm_out, y);
+        ggml_format_name(cur, "mamba_out-%d", il);
+        return cur;
+    }
+
     // build_attention_layer (nemotron-h.cpp:277-292) -> build_qkv (separate Q/K/V), build_attn (:3212), mha (:2948)
     ggml_tensor* build_attention(ggml_tensor* cur, int il, int64_t T, int slot, int64_t n_kv, GraphIn& gi) {
         const LayerW& l = W.L[(size_t) il];
@@ -1032,7 +1130,31 @@ struct Engine {
         v = ggml_permute(ctx0, v, 0, 2, 1, 3);
         const float kq_scale = 1.0f / std::sqrt((float) hd);
         ggml_tensor* o = nullptr;
-        if (!verify || T == 1) {
+        if (rows_mode) {
+            // one flash attention per row over its own slot's cells, with the KV length and mask row of that session's
+            // T == 1 step
+            for (int64_t t = 0; t < T; ++t) {
+                const int64_t sl = row_slot[(size_t) t];
+                const int64_t nkv_t = kv_len(row_pos[(size_t) t] + 1);
+                ggml_tensor* kt = ggml_view_4d(ctx0, kc, hd, n_head_kv, nkv_t, 1, ggml_row_size(kc->type, hd),
+                                               ggml_row_size(kc->type, n_embd_gqa), ggml_row_size(kc->type, n_embd_gqa * kv_size),
+                                               ggml_row_size(kc->type, n_embd_gqa * kv_size) * (size_t) sl);
+                ggml_tensor* vt = ggml_view_4d(ctx0, vc, hd, n_head_kv, nkv_t, 1, ggml_row_size(vc->type, hd),
+                                               ggml_row_size(vc->type, n_embd_gqa), ggml_row_size(vc->type, n_embd_gqa * kv_size),
+                                               ggml_row_size(vc->type, n_embd_gqa * kv_size) * (size_t) sl);
+                kt = ggml_permute(ctx0, kt, 0, 2, 1, 3);
+                vt = ggml_permute(ctx0, vt, 0, 2, 1, 3);
+                ggml_tensor* qt = ggml_view_4d(ctx0, q, q->ne[0], 1, q->ne[2], q->ne[3], q->nb[1], q->nb[2], q->nb[3], (size_t) t * q->nb[1]);
+                ggml_tensor* mt = ggml_view_4d(ctx0, gi.kq_mask, nkv_t, 1, 1, 1, gi.kq_mask->nb[1], gi.kq_mask->nb[2], gi.kq_mask->nb[3],
+                                               (size_t) t * gi.kq_mask->nb[1]);
+                ggml_tensor* ot = ggml_flash_attn_ext(ctx0, qt, kt, vt, mt, kq_scale, 0.0f, 0.0f);
+                ggml_flash_attn_ext_add_sinks(ot, nullptr);
+                ggml_flash_attn_ext_set_n_kv_max(ot, 0);
+                ggml_prec_set_acc(ot, GGML_PREC_F32);
+                ot = ggml_reshape_2d(ctx0, ot, ot->ne[0] * ot->ne[1], ot->ne[2] * ot->ne[3]);
+                o = t == 0 ? ot : ggml_concat(ctx0, o, ot, 1);
+            }
+        } else if (!verify || T == 1) {
             o = ggml_flash_attn_ext(ctx0, q, k, v, gi.kq_mask, kq_scale, 0.0f, 0.0f);
             ggml_flash_attn_ext_add_sinks(o, nullptr);
             ggml_flash_attn_ext_set_n_kv_max(o, 0);
@@ -1070,7 +1192,7 @@ struct Engine {
         ggml_tensor* inp_emb = cur;
         ggml_tensor* inp_latent = ggml_mul_mat(ctx0, l.latent_down, cur);
         ggml_tensor* router_logits = nullptr;
-        if (verify && cur->ne[1] > 3) {
+        if ((verify || rows_mode) && cur->ne[1] > 3) {
             // F32 router: MMVF serves ne11 <= 3 on sm_120 (mmvf.cu ggml_cuda_should_use_mmvf); keep T == 1 numerics per token
             for (int64_t t = 0; t < cur->ne[1]; ++t) {
                 ggml_tensor* ct = ggml_view_2d(ctx0, cur, cur->ne[0], 1, cur->nb[1], (size_t) t * cur->nb[1]);
@@ -1112,7 +1234,7 @@ struct Engine {
         ggml_tensor* experts = nullptr;
         SlotPool* pool = C.on ? C.pools[(size_t) il].get() : nullptr;
         const bool lo = il < n_cpu_moe;
-        const bool cached_step = n_tokens == 1 || (verify && n_tokens <= NH_TMAX);
+        const bool cached_step = n_tokens == 1 || ((verify || rows_mode) && n_tokens <= NH_TMAX);
         if (pool && cached_step && lo) {
             // the CPU path of llama.cpp (ffn_moe_up / relu / sqr / ffn_moe_down on ggml-cpu), split into cached hits
             // (CPU-exact CUDA kernels) and misses (ggml-cpu vec_dot), see SlotPool
@@ -1222,6 +1344,14 @@ struct Engine {
         ggml_set_input(gi.s_copy);
         gi.s_copy_main = ggml_view_1d(ctx0, gi.s_copy, n_seqs, 0);
         gi.s_copy_tail = ggml_view_1d(ctx0, gi.s_copy, n_rs - 1, gi.s_copy->nb[0]);
+        gi.s_copy_r.clear();
+        if (rows_mode)
+            for (int64_t r = 0; r < T; ++r) {
+                ggml_tensor* sc = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rs);
+                ggml_format_name(sc, "rs_s_copy_r%d", (int) r);
+                ggml_set_input(sc);
+                gi.s_copy_r.push_back(sc);
+            }
         gi.out_ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_out);
         ggml_set_name(gi.out_ids, "out_ids");
         ggml_set_input(gi.out_ids);
@@ -1425,8 +1555,8 @@ struct Engine {
             if (!pp) continue;
             int cap = pp->lo ? (cap_lo > 0 ? cap_lo : cap_u) : (cap_hi > 0 ? cap_hi : cap_u);
             cap = std::min(cap, n_expert);
-            if (!pp->lo && cap < C.n_used * k_snap)
-                throw std::runtime_error("nh_engine cache: VRAM budget too small for the hi pools (need " + std::to_string(C.n_used * k_snap) +
+            if (!pp->lo && cap < C.n_used * std::max(k_snap, rows_max))
+                throw std::runtime_error("nh_engine cache: VRAM budget too small for the hi pools (need " + std::to_string(C.n_used * std::max(k_snap, rows_max)) +
                                          " slots per layer, have " + std::to_string(cap) + "); lower --vram-reserve-mib or use --cache lo");
             pp->cap = cap;
             pp->t_up = ggml_new_tensor_3d(C.ctx, pp->tu, C.n_in, C.n_ff, std::max(cap, 1));
@@ -1766,6 +1896,85 @@ struct Engine {
             }
         }
     }
+
+    // a --batch decode window: the next token of S sessions (distinct slots) in one graph, row r computed as session
+    // slots[r]'s own T == 1 step (rows mode).  Leaves S logits rows.
+    void decode_rows(const int* slots, const int32_t* tok, int S) {
+        check_tokens(tok, S);
+        if (S < 1 || S > NH_TMAX || S > M.n_slots) throw std::runtime_error("nh_engine: decode window of " + std::to_string(S) + " rows");
+        row_slot.assign(slots, slots + S);
+        row_pos.assign((size_t) S, 0);
+        int64_t n_kv = 0;
+        for (int r = 0; r < S; ++r) {
+            for (int q = 0; q < r; ++q)
+                if (slots[q] == slots[r]) throw std::runtime_error("nh_engine: a decode window names a slot twice");
+            const int64_t pos = M.n_past[(size_t) slots[r]];
+            if (pos < 1 || pos + 1 > M.n_ctx) throw std::runtime_error("nh_engine: decode window: slot context empty or full");
+            row_pos[(size_t) r] = pos;
+            n_kv = std::max(n_kv, kv_len(pos + 1));
+        }
+        rows_mode = true;
+        verify = false;
+        want_h = false;
+        if (C.on) C.step++;
+        GraphIn gi;
+        ggml_backend_sched_reset(sched);
+        ggml_backend_sched_set_eval_callback(sched, nullptr, nullptr);
+        build_graph(S, 0, 0, n_kv, S, -1, gi);
+        if (!ggml_backend_sched_alloc_graph(sched, gf)) throw std::runtime_error("nh_engine: rows graph alloc failed");
+        ggml_backend_tensor_set(gi.tokens, tok, 0, (size_t) S * 4);
+        {
+            std::vector<int64_t> idx((size_t) S);
+            for (int r = 0; r < S; ++r) idx[(size_t) r] = (int64_t) slots[r] * M.n_ctx * (M.n_slots > 1 ? 1 : 0) + row_pos[(size_t) r];
+            ggml_backend_tensor_set(gi.k_idxs, idx.data(), 0, idx.size() * 8);
+            ggml_backend_tensor_set(gi.v_idxs, idx.data(), 0, idx.size() * 8);
+            std::vector<ggml_fp16_t> mask((size_t) (n_kv * S));
+            const ggml_fp16_t keep = ggml_fp32_to_fp16(0.0f), drop = ggml_fp32_to_fp16(-INFINITY);
+            for (int r = 0; r < S; ++r)
+                for (int64_t j = 0; j < n_kv; ++j) mask[(size_t) (r * n_kv + j)] = j <= row_pos[(size_t) r] ? keep : drop;
+            ggml_backend_tensor_set(gi.kq_mask, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
+            for (int r = 0; r < S; ++r) {
+                const int32_t sc = slots[r];
+                ggml_backend_tensor_set(gi.s_copy_r[(size_t) r], &sc, 0, 4);
+            }
+            std::vector<int32_t> oi((size_t) S);
+            for (int r = 0; r < S; ++r) oi[(size_t) r] = r;
+            ggml_backend_tensor_set(gi.out_ids, oi.data(), 0, oi.size() * 4);
+        }
+        cx.reset();
+        ggml_backend_cpu_set_n_threads(cpu, n_threads);
+        const ggml_status st = ggml_backend_sched_graph_compute(sched, gf);
+        rows_mode = false;
+        if (st != GGML_STATUS_SUCCESS) throw std::runtime_error("nh_engine: rows graph compute failed");
+        check_cache_error();
+        const size_t nv = (size_t) gi.logits->ne[0];
+        logits.resize(nv * (size_t) S);
+        ggml_backend_tensor_get(gi.logits, logits.data(), 0, logits.size() * 4);
+        ggml_free(ctx0);
+        ctx0 = nullptr;
+        for (int r = 0; r < S; ++r) M.n_past[(size_t) slots[r]] = (int) (row_pos[(size_t) r] + 1);
+    }
+
+    // session dst takes session src's state (its first n_past cells of K/V, the conv and SSM state rows)
+    void copy_session(int src, int dst) {
+        if (src == dst) return;
+        const int64_t n = M.n_past[(size_t) src];
+        for (int il = 0; il < W.g.n_layer; ++il) {
+            for (ggml_tensor* t : {M.k[(size_t) il], M.v[(size_t) il]}) {
+                if (!t || n == 0) continue;
+                const cudaError_t e = cudaMemcpy((char*) t->data + (size_t) dst * t->nb[2], (const char*) t->data + (size_t) src * t->nb[2],
+                                                 (size_t) n * t->nb[1], cudaMemcpyDeviceToDevice);
+                if (e != cudaSuccess) throw std::runtime_error(std::string("nh_engine: session copy: ") + cudaGetErrorString(e));
+            }
+            for (ggml_tensor* t : {M.r[(size_t) il], M.s[(size_t) il]}) {
+                if (!t) continue;
+                const cudaError_t e = cudaMemcpy((char*) t->data + (size_t) dst * t->nb[1], (const char*) t->data + (size_t) src * t->nb[1],
+                                                 t->nb[1], cudaMemcpyDeviceToDevice);
+                if (e != cudaSuccess) throw std::runtime_error(std::string("nh_engine: session copy: ") + cudaGetErrorString(e));
+            }
+        }
+        M.n_past[(size_t) dst] = (int) n;
+    }
 };
 
 // ---- speculative decoding (Phase 4): drafts from prompt lookup (n-gram) and/or the MTP head, verified greedily in
@@ -1813,10 +2022,13 @@ struct SpecCfg {
 // Generation after the prompt: `last` = logits of the last prompt token (and, with the MTP head, E.hrows = its
 // result_norm row).  Emits tokens (and, through on_row, the logits row that predicted each one) exactly as the plain
 // loop does: same tokens, same rows, same stop rules.
+// serve: `slot` is the session, `cancel()` true ends the answer after the token just emitted, `between()` runs between
+// two steps (the --batch windows of the other sessions) and true there means this step drafts nothing.
 template <class OnRow>
 void spec_generate(Engine& E, const SpecCfg& cfg, SpecStats& st, std::vector<int32_t> ctx_toks, std::vector<float> last,
                    int maxgen, bool stop_eog, const std::set<int>& eog, std::vector<int32_t>& out, OnRow on_row,
-                   std::vector<double>* t_tok) {
+                   std::vector<double>* t_tok, int slot = 0, const std::function<bool()>& cancel = nullptr,
+                   const std::function<bool()>& between = nullptr) {
     const int nv = (int) last.size();
     const int64_t ne = E.W.g.n_embd;
     const bool use_mtp = E.mtp_on && (cfg.mode == 2 || cfg.mode == 3);
@@ -1836,10 +2048,13 @@ void spec_generate(Engine& E, const SpecCfg& cfg, SpecStats& st, std::vector<int
         out.push_back(x);
         ctx_toks.push_back(x);
         if (t_tok) t_tok->push_back(now_s());
-        if ((stop_eog && eog.count(x)) || (int) out.size() >= maxgen) break;
+        if ((stop_eog && eog.count(x)) || (int) out.size() >= maxgen || (cancel && cancel())) break;
+        const bool busy = between && between();
         const double td0 = now_s();
         int kmax = std::min(cfg.k, std::min(NH_TMAX - 1, maxgen - (int) out.size()));
-        if (cfg.min_acc > 0 && ema < cfg.min_acc && ++since_probe < cfg.probe_every) {
+        if (busy) {
+            kmax = 0;
+        } else if (cfg.min_acc > 0 && ema < cfg.min_acc && ++since_probe < cfg.probe_every) {
             kmax = 0;
             st.gated_steps++;
         } else {
@@ -1888,10 +2103,10 @@ void spec_generate(Engine& E, const SpecCfg& cfg, SpecStats& st, std::vector<int
             }
         }
         st.t_draft += now_s() - td0;
-        const int64_t pos0 = E.M.n_past[0];
+        const int64_t pos0 = E.M.n_past[(size_t) slot];
         if (d.empty()) {
             const double t0 = now_s();
-            E.decode(&out.back(), 1, 0, false);
+            E.decode(&out.back(), 1, slot, false);
             std::memcpy(last.data(), E.logits.data(), sizeof(float) * (size_t) nv);
             if (use_mtp) {
                 // (h_last, x) was queued above but not run (no drafting this step): keep it queued, h_last = new row
@@ -1908,7 +2123,7 @@ void spec_generate(Engine& E, const SpecCfg& cfg, SpecStats& st, std::vector<int
         toks.insert(toks.end(), d.begin(), d.end());
         const int T = (int) toks.size();
         const double t0 = now_s();
-        E.decode(toks.data(), T, 0, true, true);
+        E.decode(toks.data(), T, slot, true, true);
         st.t_verify += now_s() - t0;
         st.t_by_T[T] += now_s() - t0;
         st.n_by_T[T]++;
@@ -1931,7 +2146,7 @@ void spec_generate(Engine& E, const SpecCfg& cfg, SpecStats& st, std::vector<int
             ctx_toks.push_back(d[(size_t) i]);
             if (t_tok) t_tok->push_back(now_s());
             a++;
-            if ((stop_eog && eog.count(d[(size_t) i])) || (int) out.size() >= maxgen) {
+            if ((stop_eog && eog.count(d[(size_t) i])) || (int) out.size() >= maxgen || (cancel && cancel())) {
                 stop = true;
                 break;
             }
@@ -1940,7 +2155,12 @@ void spec_generate(Engine& E, const SpecCfg& cfg, SpecStats& st, std::vector<int
         st.src_accepted[src] += a - 1;
         ema = 0.8 * ema + 0.2 * (double) (a - 1) / (double) (T - 1);
         st.acc_hist[a - 1]++;
-        if (stop) break;
+        if (stop) {
+            // the state keeps x and the accepted drafts (the rejected rows are rolled back), so a later request that
+            // continues this session reads on from a consistent state
+            E.spec_commit(slot, pos0, T, a);
+            break;
+        }
         std::memcpy(last.data(), E.logits.data() + (size_t) (a - 1) * nv, sizeof(float) * (size_t) nv);
         if (use_mtp) {
             // committed rows pos0 .. pos0+a-1: pairs (h_{pos0+i}, d_{i+1}) for i < a-1 wait for the next head call
@@ -1951,7 +2171,7 @@ void spec_generate(Engine& E, const SpecCfg& cfg, SpecStats& st, std::vector<int
             h_last.assign(E.hrows.begin() + (size_t) (a - 1) * ne, E.hrows.begin() + (size_t) a * ne);
         }
         const double tc = now_s();
-        E.spec_commit(0, pos0, T, a);
+        E.spec_commit(slot, pos0, T, a);
         st.t_commit += now_s() - tc;
     }
 }
@@ -1976,6 +2196,456 @@ void print_spec_stats(const SpecStats& st, FILE* f) {
         if (st.n_by_T[T]) std::fprintf(f, "[spec] decode T=%d: %ld steps, mean %.3f ms\n", T, st.n_by_T[T], 1e3 * st.t_by_T[T] / (double) st.n_by_T[T]);
 }
 
+// ================================================================================================ serve
+// The engine protocol of serve/server.py, as src/qwen35/q36_engine.cu speaks it (READY / INFO / GEN / BGEN / T / BT / PP /
+// DONE / BDONE / BADM / STOP / BSTOP / BYIELD / ERR):
+//   GEN <max_new> [key=value ...] <id,id,...>      a request alone on the control lines: PP lines while its prompt is
+//                                                   read, a T line per token, then DONE.  Greedy requests decode with the
+//                                                   speculative steps of --spec (verified, so the text is the greedy text)
+//   BGEN <slot> <max_new> [keys] <ids>              (--batch N) the prompt is read into batch slot <slot>; its first token
+//                                                   comes as T + DONE + BADM <slot> <0|1>, the rest as BT <slot> <id> lines,
+//                                                   one per decode window over every decoding slot, until BDONE
+//   STOP / BSTOP <slot>                             end the request on the control lines / a slot at its next window
+// DONE <produced> <prompt_n> <prompt_ms> <decode_ms> <finish> <drafts_accepted> <drafts_offered> <reused> 0 0 0 0 0.0
+//      <prompt_read> 0      (the 16 fields of server.py _parse_done)
+struct Sampling {
+    float temperature = 0.f, top_p = 1.f, min_p = 0.f, repeat = 1.f, freq = 0.f, present = 0.f;
+    int top_k = 20, last_n = 0;
+    unsigned long long seed = 0;
+    bool needs_logits() const { return temperature > 0.f || repeat != 1.f || freq != 0.f || present != 0.f; }
+};
+
+// (q36_engine.cu sample(): penalties over the last n tokens, then greedy, or top-k / top-p / min-p at the temperature)
+int sample(std::vector<float>& lg, const Sampling& s, const std::vector<int32_t>& hist, std::mt19937_64& rng) {
+    if (s.last_n != 0 && (s.repeat != 1.f || s.freq != 0.f || s.present != 0.f)) {
+        std::map<int, int> cnt;
+        const size_t from = s.last_n < 0 || (size_t) s.last_n >= hist.size() ? 0 : hist.size() - (size_t) s.last_n;
+        for (size_t i = from; i < hist.size(); ++i) ++cnt[hist[i]];
+        for (const auto& kv : cnt) {
+            float& v = lg[(size_t) kv.first];
+            if (s.repeat != 1.f) v = v > 0 ? v / s.repeat : v * s.repeat;
+            v -= (float) kv.second * s.freq + s.present;
+        }
+    }
+    if (s.temperature <= 0.f) return argmax(lg.data(), (int) lg.size());
+    const int kk = std::max(1, std::min(s.top_k > 0 ? s.top_k : 64, (int) lg.size()));
+    std::vector<int> idx(lg.size());
+    for (size_t i = 0; i < idx.size(); ++i) idx[i] = (int) i;
+    std::partial_sort(idx.begin(), idx.begin() + kk, idx.end(), [&](int a, int b) { return lg[(size_t) a] > lg[(size_t) b]; });
+    idx.resize((size_t) kk);
+    std::vector<double> pr(idx.size());
+    const double mx = lg[(size_t) idx[0]];
+    double sum = 0;
+    for (size_t i = 0; i < idx.size(); ++i) sum += (pr[i] = std::exp((lg[(size_t) idx[i]] - mx) / s.temperature));
+    size_t keep = idx.size();
+    double cum = 0;
+    for (size_t i = 0; i < idx.size(); ++i) {
+        if (pr[i] / sum < s.min_p * (pr[0] / sum)) { keep = i; break; }
+        cum += pr[i] / sum;
+        if (cum >= s.top_p) { keep = i + 1; break; }
+    }
+    keep = std::max<size_t>(1, keep);
+    double tot = 0;
+    for (size_t i = 0; i < keep; ++i) tot += pr[i];
+    std::uniform_real_distribution<double> u(0.0, tot);
+    double r = u(rng);
+    for (size_t i = 0; i < keep; ++i)
+        if ((r -= pr[i]) <= 0) return idx[i];
+    return idx[keep - 1];
+}
+
+std::vector<int32_t> parse_ids(const char* s) {
+    std::vector<int32_t> v;
+    while (*s) {
+        while (*s == ',' || *s == ' ') ++s;
+        if (!*s) break;
+        char* e = nullptr;
+        const long x = std::strtol(s, &e, 10);
+        if (e == s) break;
+        v.push_back((int32_t) x);
+        s = e;
+    }
+    return v;
+}
+
+struct Serve {
+    Engine& E;
+    SpecCfg spec;
+    int chunk;
+    std::set<int> eog;
+    int nv;
+    std::mutex mu;
+    std::condition_variable cv;
+    std::deque<std::string> lines;
+    bool eof = false;
+    std::atomic<bool> stop{false};
+    struct Slot {
+        bool active = false, stop = false;
+        int32_t x = 0;
+        int64_t produced = 0, max_new = 0;
+        Sampling smp;
+        std::mt19937_64 rng;
+        std::vector<int32_t> hist;
+        double t0 = 0;
+    };
+    struct Sess {
+        std::vector<int32_t> live;   // the tokens the slot's state holds (live.size() == E.M.n_past[slot])
+        bool active = false;         // a batch slot decoding
+        uint64_t used = 0;
+    };
+    std::vector<Slot> slots;
+    std::vector<Sess> sess;
+    int n_active = 0;
+    uint64_t clock = 0;
+    std::vector<float> lg;
+    long long windows = 0, window_rows = 0;
+    double window_s = 0;
+    int read_windows = 1;
+
+    Serve(Engine& e, const SpecCfg& sc, int ch, const std::set<int>& eg)
+        : E(e), spec(sc), chunk(ch), eog(eg), nv(e.W.g.n_vocab), slots((size_t) e.M.n_slots), sess((size_t) e.M.n_slots) {
+        if (const char* v = std::getenv("STRATA_NH_READ_WINDOWS")) read_windows = std::max(0, std::min(64, std::atoi(v)));
+    }
+    bool is_eos(int t) const { return eog.count(t) > 0; }
+    static double ms_since(double t0) { return (now_s() - t0) * 1e3; }
+    int n_sess() const { return E.M.n_slots; }
+
+    void poll_control() {
+        std::lock_guard<std::mutex> lk(mu);
+        for (auto it = lines.begin(); it != lines.end();) {
+            if (it->rfind("BSTOP ", 0) == 0) {
+                const int b = std::atoi(it->c_str() + 6);
+                if (b >= 0 && b < (int) slots.size()) slots[(size_t) b].stop = true;
+                it = lines.erase(it);
+            } else if (it->rfind("BYIELD", 0) == 0) {
+                it = lines.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    // one decode window: the next token of every decoding batch slot (one graph, rows mode)
+    void window() {
+        poll_control();
+        std::vector<int> sl;
+        std::vector<int32_t> tk;
+        for (int b = 0; b < n_sess(); ++b)
+            if (slots[(size_t) b].active) {
+                sl.push_back(b);
+                tk.push_back(slots[(size_t) b].x);
+            }
+        if (sl.empty()) return;
+        const double t0 = now_s();
+        if (sl.size() == 1) E.decode(tk.data(), 1, sl[0], false);
+        else E.decode_rows(sl.data(), tk.data(), (int) sl.size());
+        window_s += now_s() - t0;
+        ++windows;
+        window_rows += (long long) sl.size();
+        for (size_t r = 0; r < sl.size(); ++r) {
+            const int b = sl[r];
+            Slot& st = slots[(size_t) b];
+            Sess& ss = sess[(size_t) b];
+            ss.live.push_back(st.x);
+            int y;
+            if (st.smp.needs_logits()) {
+                lg.assign(E.logits.begin() + (long) (r * (size_t) nv), E.logits.begin() + (long) ((r + 1) * (size_t) nv));
+                y = sample(lg, st.smp, st.hist, st.rng);
+            } else {
+                y = argmax(E.logits.data() + r * (size_t) nv, nv);
+            }
+            std::printf("BT %d %d\n", b, y);
+            ++st.produced;
+            st.hist.push_back(y);
+            const char* fin = is_eos(y) ? "stop" : st.stop ? "cancel" : st.produced >= st.max_new ? "length"
+                              : E.M.n_past[(size_t) b] + 1 > E.M.n_ctx ? "length" : nullptr;
+            if (fin) {
+                std::printf("BDONE %d %lld %s %.1f\n", b, (long long) st.produced, fin, ms_since(st.t0));
+                st.active = false;
+                ss.active = false;
+                --n_active;
+            } else {
+                st.x = y;
+            }
+        }
+        std::fflush(stdout);
+    }
+
+    size_t match_len(const Sess& ss, const std::vector<int32_t>& ids) const {
+        const size_t L = ss.live.size();
+        if (L == 0 || L >= ids.size() || !std::equal(ss.live.begin(), ss.live.end(), ids.begin())) return 0;
+        return L;
+    }
+
+    int pick_session(const std::vector<int32_t>& ids) const {
+        int best = -1, free_empty = -1, lru = -1;
+        size_t bl = 0;
+        for (int i = 0; i < n_sess(); ++i) {
+            const Sess& ss = sess[(size_t) i];
+            if (ss.active) continue;
+            const size_t l = match_len(ss, ids);
+            if (l > bl) { bl = l; best = i; }
+            if (ss.live.empty() && free_empty < 0) free_empty = i;
+            if (lru < 0 || ss.used < sess[(size_t) lru].used) lru = i;
+        }
+        return best >= 0 ? best : free_empty >= 0 ? free_empty : lru;
+    }
+
+    void err(const std::string& m) {
+        std::printf("ERR %s\n", m.c_str());
+        std::fflush(stdout);
+    }
+
+    void request(const std::string& line) {
+        const bool adm = line[0] == 'B';
+        const bool geni = line.rfind(adm ? "BGENI " : "GENI ", 0) == 0;
+        if (!adm && !geni && line.rfind("GEN ", 0) != 0) {
+            err("expected: GEN <max_new> [key=value ...] <id,id,...>");
+            return;
+        }
+        if (geni) { err("this engine was started without --vision"); return; }
+        char* p = const_cast<char*>(line.c_str()) + (adm ? 5 : 4);
+        int slot = -1;
+        if (adm) {
+            char* e1 = nullptr;
+            const long b = std::strtol(p, &e1, 10);
+            if (e1 == p || b < 0 || b >= (long) slots.size() || slots[(size_t) b].active || n_sess() < 2) {
+                std::printf("ERR BGEN: no such free slot (--batch %d) or a bad max_new\n", n_sess() < 2 ? 0 : n_sess());
+                std::fflush(stdout);
+                return;
+            }
+            p = e1;
+            slot = (int) b;
+        }
+        const long long max_new = std::strtoll(p, &p, 10);
+        Sampling smp;
+        for (;;) {
+            while (*p == ' ') ++p;
+            const char* st0 = p;
+            while (*p && *p != ' ') ++p;
+            const std::string tk(st0, (size_t) (p - st0));
+            const size_t eq = tk.find('=');
+            if (tk.empty() || eq == std::string::npos) { p = const_cast<char*>(st0); break; }
+            const std::string key = tk.substr(0, eq);
+            const char* v = tk.c_str() + eq + 1;
+            if (key == "temperature") smp.temperature = std::strtof(v, nullptr);
+            else if (key == "top_p") smp.top_p = std::strtof(v, nullptr);
+            else if (key == "top_k") smp.top_k = std::atoi(v);
+            else if (key == "min_p") smp.min_p = std::strtof(v, nullptr);
+            else if (key == "penalty_last_n") smp.last_n = std::atoi(v);
+            else if (key == "penalty_repeat") smp.repeat = std::strtof(v, nullptr);
+            else if (key == "penalty_freq") smp.freq = std::strtof(v, nullptr);
+            else if (key == "penalty_present") smp.present = std::strtof(v, nullptr);
+            else if (key == "seed") smp.seed = std::strtoull(v, nullptr, 10);
+            // other keys of server.py (ckpt, pin, cvec, img_keys, logit bias, tuning) are not used by this engine
+        }
+        const std::vector<int32_t> ids = parse_ids(p);
+        if (max_new < 1 || ids.empty()) { err("bad request: max_new or the ids"); return; }
+        if ((int64_t) ids.size() + max_new > E.M.n_ctx) {
+            std::printf("ERR prompt (%zu tokens) + max_new (%lld) exceeds the context (%d)\n", ids.size(), max_new, E.M.n_ctx);
+            std::fflush(stdout);
+            return;
+        }
+        for (int32_t t : ids)
+            if (t < 0 || t >= nv) { err("a token id is outside the vocabulary"); return; }
+        stop.store(false);
+        const int s = adm ? slot : pick_session(ids);
+        Sess& ss = sess[(size_t) s];
+        size_t reuse = match_len(ss, ids);
+        if (adm) {   // another idle session holding more of this prompt: copy its state
+            int src = -1;
+            size_t best = reuse;
+            for (int i = 0; i < n_sess(); ++i) {
+                if (i == s || sess[(size_t) i].active) continue;
+                const size_t l = match_len(sess[(size_t) i], ids);
+                if (l > best) { best = l; src = i; }
+            }
+            if (src >= 0) {
+                E.copy_session(src, s);
+                ss.live = sess[(size_t) src].live;
+                reuse = best;
+            }
+        }
+        if (reuse == 0) {
+            E.clear_slot(s);
+            ss.live.clear();
+        }
+        ss.used = ++clock;
+        const double t0 = now_s();
+        const int64_t fresh = (int64_t) (ids.size() - reuse);
+        bool cancelled = false;
+        int64_t done = 0;
+        // the prompt in --chunk ubatches from the first fresh token (a fresh prompt: the CLI's chunks exactly)
+        for (size_t off = reuse; off < ids.size();) {
+            const int n = (int) std::min<size_t>((size_t) chunk, ids.size() - off);
+            E.decode(ids.data() + off, n, s, false);
+            ss.live.insert(ss.live.end(), ids.begin() + (long) off, ids.begin() + (long) off + n);
+            off += (size_t) n;
+            done += n;
+            std::printf("PP %lld %lld %.0f %.1f\n", (long long) done, (long long) fresh, ms_since(t0),
+                        (double) done / std::max(1e-9, ms_since(t0) / 1000.0));
+            std::fflush(stdout);
+            poll_control();
+            if (done < fresh) {
+                for (int w = 0; w < read_windows && n_active > 0; ++w) window();
+                if (stop.load()) { cancelled = true; break; }
+            }
+        }
+        const double prompt_ms = ms_since(t0);
+        if (cancelled) {
+            std::printf("DONE 0 %zu %.1f 0.0 cancel 0 0 %zu 0 0 0 0 0.0 %lld 0\n", ids.size(), prompt_ms, reuse, (long long) done);
+            if (adm) std::printf("BADM %d 0\n", slot);
+            std::fflush(stdout);
+            return;
+        }
+        std::vector<float> last(E.logits.begin(), E.logits.begin() + nv);
+        std::mt19937_64 rng(smp.seed);
+        std::vector<int32_t> hist = ids;
+        const double d0 = now_s();
+        if (adm) {
+            int nx;
+            if (smp.needs_logits()) nx = sample(last, smp, hist, rng);
+            else nx = argmax(last.data(), nv);
+            std::printf("T %d\n", nx);
+            hist.push_back(nx);
+            const char* fin = is_eos(nx) ? "stop" : stop.load() ? "cancel" : max_new <= 1 ? "length"
+                              : E.M.n_past[(size_t) s] + 1 > E.M.n_ctx ? "length" : nullptr;
+            const bool cont = fin == nullptr;
+            std::printf("DONE 1 %zu %.1f %.1f %s 0 0 %zu 0 0 0 0 0.0 %lld 0\n", ids.size(), prompt_ms, ms_since(d0),
+                        cont ? "length" : fin, reuse, (long long) fresh);
+            if (cont) {
+                Slot& st = slots[(size_t) slot];
+                st = Slot{};
+                st.active = true;
+                st.x = nx;
+                st.produced = 1;
+                st.max_new = max_new;
+                st.smp = smp;
+                st.rng = rng;
+                st.hist = hist;
+                st.t0 = now_s();
+                ss.active = true;
+                ++n_active;
+            }
+            std::printf("BADM %d %d\n", slot, cont ? 1 : 0);
+            std::fflush(stdout);
+            std::fprintf(stderr, "[nh_serve] slot %d: prompt %zu tokens = %zu reused + %lld read in %.0f ms (%.1f tok/s)%s\n", slot,
+                         ids.size(), reuse, (long long) fresh, prompt_ms, prompt_ms > 0 ? 1000.0 * (double) fresh / prompt_ms : 0.0,
+                         cont ? "" : ", done at once");
+            return;
+        }
+        long long produced = 0, offered = 0, accepted = 0;
+        const char* finish = "length";
+        std::vector<int32_t> out;
+        if (!smp.needs_logits() && spec.mode) {
+            // greedy: the speculative steps of the CLI (spec_generate); every token is the plain greedy token
+            SpecStats sst;
+            auto emit = [&](const float*, int t) {
+                std::printf("T %d\n", t);
+                std::fflush(stdout);
+                ++produced;
+            };
+            const std::function<bool()> cancel = [&]() { return stop.load(); };
+            const std::function<bool()> between = [&]() {
+                if (n_active == 0) return false;
+                window();
+                return true;
+            };
+            spec_generate(E, spec, sst, ids, last, (int) max_new, true, eog, out, emit, nullptr, s, cancel, between);
+            offered = sst.drafted;
+            accepted = sst.accepted;
+            finish = !out.empty() && is_eos(out.back()) ? "stop" : (long long) out.size() >= max_new ? "length" : "cancel";
+        } else {
+            for (;;) {
+                int nx;
+                if (smp.needs_logits()) nx = sample(last, smp, hist, rng);
+                else nx = argmax(last.data(), nv);
+                std::printf("T %d\n", nx);
+                std::fflush(stdout);
+                ++produced;
+                hist.push_back(nx);
+                out.push_back(nx);
+                if (is_eos(nx)) { finish = "stop"; break; }
+                if (produced >= max_new) break;
+                if (stop.load()) { finish = "cancel"; break; }
+                if (n_active > 0) window();
+                if (E.M.n_past[(size_t) s] + 1 > E.M.n_ctx) break;
+                E.decode(&nx, 1, s, false);
+                last.assign(E.logits.begin(), E.logits.begin() + nv);
+            }
+        }
+        // the state holds the prompt and the generated tokens up to n_past (the last emitted one is not read yet)
+        {
+            std::vector<int32_t> all = ids;
+            all.insert(all.end(), out.begin(), out.end());
+            const size_t np = (size_t) E.M.n_past[(size_t) s];
+            if (np > all.size()) throw std::runtime_error("nh_serve: session state longer than its tokens");
+            all.resize(np);
+            ss.live = std::move(all);
+        }
+        const double decode_ms = ms_since(d0);
+        std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu 0 0 0 0 0.0 %lld 0\n", produced, ids.size(), prompt_ms, decode_ms,
+                    finish, accepted, offered, reuse, (long long) fresh);
+        std::fflush(stdout);
+        std::fprintf(stderr, "[nh_serve] session %d: prompt %zu tokens = %zu reused + %lld read in %.0f ms (%.1f tok/s), %lld generated "
+                             "in %.0f ms (%.1f tok/s), drafts accepted %lld of %lld (%s)\n", s, ids.size(), reuse, (long long) fresh,
+                     prompt_ms, prompt_ms > 0 ? 1000.0 * (double) fresh / prompt_ms : 0.0, produced, decode_ms,
+                     decode_ms > 0 ? 1000.0 * (double) produced / decode_ms : 0.0, accepted, offered, finish);
+    }
+
+    int run() {
+        std::printf("INFO engine=strata-nh-engine arch=nemotron_h_moe kv_slots=%d spec=%d expert_cache_mib=%.0f\n", n_sess(), spec.mode,
+                    E.C.pool_bytes / 1048576.0);
+        if (n_sess() > 1) std::printf("INFO batch_slots=%d slot_cache=1\n", n_sess());
+        std::printf("READY %d stop\n", E.M.n_ctx);
+        std::fflush(stdout);
+        std::thread reader([&] {
+            std::string l;
+            while (std::getline(std::cin, l)) {
+                if (!l.empty() && l.back() == '\r') l.pop_back();
+                if (l == "STOP") { stop.store(true); continue; }
+                std::lock_guard<std::mutex> lk(mu);
+                lines.push_back(l);
+                cv.notify_one();
+            }
+            std::lock_guard<std::mutex> lk(mu);
+            eof = true;
+            cv.notify_one();
+        });
+        reader.detach();
+        for (;;) {
+            std::string line;
+            bool have = false;
+            {
+                std::unique_lock<std::mutex> lk(mu);
+                if (n_active == 0) cv.wait(lk, [&] { return eof || !lines.empty(); });
+                if (!lines.empty()) {
+                    line = lines.front();
+                    lines.pop_front();
+                    have = true;
+                } else if (n_active == 0) {
+                    break;
+                }
+            }
+            if (!have) { window(); continue; }
+            if (line.empty()) continue;
+            if (line.rfind("BSTOP ", 0) == 0) {
+                const int b = std::atoi(line.c_str() + 6);
+                if (b >= 0 && b < (int) slots.size()) slots[(size_t) b].stop = true;
+            } else if (line.rfind("BYIELD", 0) == 0) {
+            } else if (line.rfind("GEN", 0) == 0 || line.rfind("BGEN", 0) == 0) {
+                request(line);
+            } else {
+                err("expected: GEN <max_new> [key=value ...] <id,id,...>");
+            }
+            if (n_active > 0) window();
+        }
+        std::fprintf(stderr, "[nh_serve] input closed; %lld batch windows (%lld rows, %.1f s)\n", windows, window_rows, window_s);
+        E.cache_stats(stderr);
+        return 0;
+    }
+};
+
 std::set<std::string> split_ids(const std::string& s) {
     std::set<std::string> r;
     std::stringstream ss(s);
@@ -1999,13 +2669,20 @@ int real_main(int argc, char** argv) {
     int spec_diff = 0;
     int mtp_topk = 0;
     int K = 32, chunk = 512, ctx = 32768, threads = 16, n_cpu_moe = 68;
+    bool serve_mode = false;
+    int batch = 0;
+    for (int i = 1; i < argc; ++i)
+        if (std::string(argv[i]) == "--serve") serve_mode = true;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto nx = [&]() -> std::string {
             if (i + 1 >= argc) throw std::runtime_error("missing value for " + a);
             return argv[++i];
         };
-        if (a == "--model") model = nx();
+        if (a == "--model" || a == "--native") model = nx();
+        else if (a == "--serve") serve_mode = true;
+        else if (a == "--batch" || a == "--slots") batch = std::stoi(nx());
+        else if (a == "--max-context") ctx = std::stoi(nx());
         else if (a == "--list") list = nx();
         else if (a == "--tokdir") tokdir = nx();
         else if (a == "--out") outdir = nx();
@@ -2045,19 +2722,26 @@ int real_main(int argc, char** argv) {
         else if (a == "--spec-min-acc") spec.min_acc = std::stod(nx());
         else if (a == "--spec-check") spec_check = true;
         else if (a == "--spec-diff") spec_diff = std::stoi(nx());
-        else {
+        else if (serve_mode && a.rfind("--", 0) == 0) {
+            // server.py passes the config's args plus a few of its own: one this engine does not have is said and
+            // skipped (with its value), not fatal (as q36_engine.cu)
+            const bool val = i + 1 < argc && std::string(argv[i + 1]).rfind("--", 0) != 0;
+            std::fprintf(stderr, "[nh_engine] ignoring %s%s%s (not an option of this engine)\n", a.c_str(), val ? " " : "", val ? argv[i + 1] : "");
+            if (val) ++i;
+        } else {
             std::fprintf(stderr, "unknown argument %s\n", a.c_str());
             return 2;
         }
     }
-    if (model.empty() || ((list.empty() || tokdir.empty() || outdir.empty()) && bench.empty())) {
+    if (model.empty() || ((list.empty() || tokdir.empty() || outdir.empty()) && bench.empty() && !serve_mode)) {
         std::fprintf(stderr, "usage: strata-nh-engine --model SHARD --list LIST --tokdir DIR --out RAWDIR [--k 32] "
                              "[--chunk 512] [--ctx 32768] [--threads 16] [--n-cpu-moe 68] [--force RAWDIR] [--only ids] "
                              "[--dump-sums FILE --dump-prompt ID]\n       strata-nh-engine --model SHARD --bench FILE --bench-out JSONL "
                              "[--profile NTOK] [--chunk 512] [--ctx 32768] [--threads 16] [--n-cpu-moe 68]\n"
                              "       either: [--pin] [--cache lo|all|off] [--cache-mib N] [--cap-lo N] [--cap-hi N] "
                              "[--cache-decay 0.97] [--max-admit 2] [--vram-reserve-mib 2048] [--vram-limit-mib N]\n"
-                             "       [--spec off|ngram|mtp|auto] [--spec-k 1..3] [--spec-min-acc X] [--mtp-topk N] [--spec-check]\n");
+                             "       [--spec off|ngram|mtp|auto] [--spec-k 1..3] [--spec-min-acc X] [--mtp-topk N] [--spec-check]\n"
+                             "       strata-nh-engine --serve --model SHARD [--batch 2..4] [--ctx N] [the cache/spec options]\n");
         return 2;
     }
     const std::set<std::string> only_ids = split_ids(only);
@@ -2081,11 +2765,15 @@ int real_main(int argc, char** argv) {
     E.cap_hi = cap_hi;
     E.C.decay = cache_decay;
     E.C.max_admit = max_admit;
-    if (spec.mode) E.k_snap = NH_TMAX;
+    // rollback snapshots: a verify batch has at most spec.k + 1 rows
+    if (spec.mode) E.k_snap = std::min(NH_TMAX, spec.k + 1);
+    if (batch < 0 || batch > NH_TMAX || batch == 1) throw std::runtime_error("--batch must be 2.." + std::to_string(NH_TMAX) + " (or 0: one request at a time)");
+    const int n_slots = batch >= 2 ? batch : 1;
+    E.rows_max = n_slots;
     E.mtp_on = spec.mode == 2 || spec.mode == 3;
     E.mtp_topk = mtp_topk;
     if (spec.k < 1 || spec.k > NH_TMAX - 1) throw std::runtime_error("--spec-k must be 1.." + std::to_string(NH_TMAX - 1));
-    E.init(m, n_cpu_moe, 1, ctx, threads, chunk, cache_mode);
+    E.init(m, n_cpu_moe, n_slots, ctx, threads, chunk, cache_mode);
     {
         size_t fr = 0, tot = 0;
         ggml_backend_dev_memory(ggml_backend_get_device(E.gpu), &fr, &tot);
@@ -2096,6 +2784,10 @@ int real_main(int argc, char** argv) {
     }
     const int nv = m.g.n_vocab;
     const std::set<int> eog = {11, 2};   // llama-vocab.cpp:3172-3202 (<|im_end|>, </s>), :3233 (eos)
+    if (serve_mode) {
+        Serve sv(E, spec, chunk, eog);
+        return sv.run();
+    }
     if (!bench.empty()) {
         // Gate 3 bench: each line "name n_predict ignore_eos reps n_tok tok...". Timing as llama-server
         // (server-common.h:405-480): prompt time = start -> first token sampled; decode tok/s = (n_gen - 1) / (t_last_token
