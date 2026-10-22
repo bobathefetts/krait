@@ -365,7 +365,9 @@ inline MetaValue read_value(Cursor& c, MetaType t, int depth = 0) {
         v.items.reserve((size_t)std::min<uint64_t>(v.count, 64));
         for (uint64_t i = 0; i < v.count; ++i) {
             MetaValue e = read_value(c, v.elem, depth + 1);
-            if (i < 64) v.items.push_back(std::move(e)); // keep a sample; the count is what matters
+            // keep a sample of long arrays (the vocabulary: the count is what matters); short ones whole (the per-layer
+            // keys of include/strata/nemotron_h/layout.hpp: 89 blocks)
+            if (i < 64 || v.count <= 4096) v.items.push_back(std::move(e));
         }
         break;
     }

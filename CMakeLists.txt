@@ -749,6 +749,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_executable(strata-q36ref src/qwen35/q36ref.cu)
   target_include_directories(strata-q36ref PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
   target_link_libraries(strata-q36ref PRIVATE strata_kernels strata_warnings ${_strata_gpu_runtime_target})
+  # Nemotron 3.5 Super (nemotron_h_moe), docs/phase2-plan.md in the port's workspace: the layout check (all shards, every
+  # tensor mapped and verified; the mmproj opened but unused)
+  add_executable(strata-nh-layout src/nemotron_h/nh_layout_main.cpp)
+  target_include_directories(strata-nh-layout PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(strata-nh-layout PRIVATE strata_warnings)
   # the engine path for the same family (serve protocol, prompt chunks, decode graph): src/qwen35/q36_engine.cu, a
   # library that `strata` switches to for a qwen35moe model (the family switch at the top of its main) and that
   # strata-q36 wraps on its own.  Not on gfx906 (#3172, #3271): it calls cuBLAS entry points the wave64 compat layer does
