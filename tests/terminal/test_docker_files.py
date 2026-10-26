@@ -187,6 +187,8 @@ class Publishing(unittest.TestCase):
         for item in payload:
             self.assertTrue(any(item == p or item.startswith(p.rstrip("/") + "/") for p in listed), f"build.sh does not copy {item}")
 
+    @unittest.skipUnless((ROOT / ".github" / "workflows" / "docker-images.yml").exists(),
+                         "Krait does not carry upstream Strata's image workflow")
     def test_workflow_is_manual_and_pushes_only_on_request(self):
         data = yaml.safe_load(self.WORKFLOW.read_text(encoding="utf-8"))
         triggers = data.get("on", data.get(True))            # YAML 1.1 reads a bare `on` as True

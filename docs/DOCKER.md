@@ -306,6 +306,10 @@ builds from source see [AMD_HIP.md](AMD_HIP.md) and [INTEL.md](INTEL.md); then p
 
 ## Publishing the images (for maintainers)
 
+> **Krait:** this section describes upstream Strata's image publishing. Krait does not carry the
+> `docker-images.yml` workflow (it pushed to upstream's `ghcr.io/niko1221/strata`), and Krait publishes no images. For the
+> Krait stack use a local build: [docker/krait](../docker/krait) (`krait:local`).
+
 The images are built from the **engine packages of a release**, never from a build on the runner, so an image holds exactly the
 files the signed update feed names. Nothing publishes by itself: a maintainer starts the workflow, after the owner's OK.
 

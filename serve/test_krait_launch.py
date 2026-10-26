@@ -9,6 +9,7 @@ import base64
 import importlib.util
 import json
 import os
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -233,6 +234,12 @@ class PinnedDownload(unittest.TestCase):
         got = {}
 
         class Ctx:
+            # what http.client.HTTPSConnection reads from its context on Python 3.11-3.13 (verify_mode, check_hostname)
+            # and sets on it (post_handshake_auth): without them the fake failed there on CI's 3.11
+            verify_mode = ssl.CERT_REQUIRED
+            check_hostname = True
+            post_handshake_auth = None
+
             def wrap_socket(self, sock, server_hostname=None):
                 got["sni"] = server_hostname
                 return sock

@@ -4,7 +4,9 @@
 
 <h1 align="center">Krait: fast local inference for NVIDIA Nemotron 3.5 Super</h1>
 
-<p align="center"><b>Run Nemotron 3.5 Super 120B locally on one 32 GB GPU such as an RTX 5090: 1.6x llama.cpp's decode speed (greedy), bit-exact.</b></p>
+<p align="center"><b>Run Nemotron 3.5 Super 120B locally on one 32 GB GPU such as an RTX 5090: 1.6x llama.cpp's decode speed (greedy), token-exact to llama.cpp b11806 on Unsloth Q4.</b></p>
+
+<p align="center"><sub>Greedy output matches llama.cpp b11806 on Unsloth's UD-Q4_K_XL files token for token (32/32 test prompts). The claim does not cover NVIDIA's original weights or other quantizations, and it is not a measure of answer quality.</sub></p>
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-5cf03a?style=flat-square" alt="License: MIT"></a>
@@ -93,8 +95,8 @@ flowchart LR
     D -->|greedy tokens| S
 ```
 
-The GPU holds the rest of the weights and a cache of the most-used experts. The routed experts of 68 layers
-(`--n-cpu-moe 68`) live in page-locked host RAM; the CPU reads those that are not in the cache. More details:
+The GPU holds the rest of the weights and a cache of the most-used experts. The routed experts of the 31 MoE layers among
+blocks 0-67 (`--n-cpu-moe 68` counts blocks, as in llama.cpp; the model has 88 blocks, 40 of them MoE) live in page-locked host RAM; the CPU reads those that are not in the cache. More details:
 [docs/KRAIT.md](docs/KRAIT.md).
 
 ## Requirements
@@ -102,7 +104,7 @@ The GPU holds the rest of the weights and a cache of the most-used experts. The 
 - **GPU:** an NVIDIA GPU with 32 GB of VRAM (tested: RTX 5090, sm_120 only) and a CUDA toolkit that supports it (sm_120
   needs CUDA 12.8 or newer; tested with 12.9). The engine refuses to start, and says why, if its expert cache does not
   fit; cards with less VRAM are untested.
-- **Host RAM:** the engine keeps the routed experts of 68 layers in RAM. Measured: engine resident set 81.3-81.8 GiB, of
+- **Host RAM:** the engine keeps the routed experts of the MoE layers in blocks 0-67 (31 of the 40) in RAM. Measured: engine resident set 81.3-81.8 GiB, of
   which `--pin` page-locks 72,261.3 MiB; tested only with 116,713 MiB of RAM visible to Linux. Before pinning, the
   engine checks the RAM available to it and locks only what fits while leaving `--pin-reserve-mib` (default 8,192 MiB)
   free; if not everything fits it says so and runs with the rest unpinned (slower).
@@ -193,11 +195,11 @@ what is called something else:
 | `STRATA_API_KEY` / `"api_key"` | `KRAIT_API_KEY` (passed on to the same server as `STRATA_API_KEY`) |
 | `--expert-cache N` / `auto` (VRAM expert cache) | `--cache all`, sized from `--vram-limit-mib` or the free VRAM minus `--vram-reserve-mib` |
 | `--vram-reserve-mib` | `--vram-reserve-mib` (default 2,048) or a hard cap with `--vram-limit-mib` |
-| experts in RAM / `--mmap-experts` | `--n-cpu-moe 68` (routed experts of 68 layers in RAM) + `--pin` (page-locked), `--pin-reserve-mib` |
+| experts in RAM / `--mmap-experts` | `--n-cpu-moe 68` (routed experts of the 31 MoE layers in blocks 0-67 in RAM) + `--pin` (page-locked), `--pin-reserve-mib` |
 | `--spec N --mtp` | `--spec mtp --spec-k 1 --spec-min-acc 0.6` (the model's own MTP block; greedy requests only) |
 | `--batch` | `--batch 2..4` (rows mode, no MTP in batch slots) |
 | `--max-context` / `--context` | `--max-context 32768` |
-| `--prompt-cache` (conversation reuse) | `--prefix-reuse on\|off` (off by default, so output stays bit-exact) |
+| `--prompt-cache` (conversation reuse) | `--prefix-reuse on\|off` (off by default, so output stays token-exact) |
 | `--vision` (`strata-vision`) | the `vision` section of `krait/config.json` (`krait-vision`, the same encoder, on the CPU) |
 | `strata-<model>.json` | `krait/config.json` + your own `krait.local.json` |
 

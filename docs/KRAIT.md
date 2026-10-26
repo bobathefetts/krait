@@ -33,8 +33,8 @@ on real prompts from the CLI (llama.cpp b11806 on the same machine: 14.3 tok/s),
 prompt in 63.4 s. MTP speculation is used only for greedy requests decoded alone; batch slots and sampled requests
 decode without it, and sampled speed was not measured. Methods and every raw number: [BENCHMARKS.md](BENCHMARKS.md).
 
-More requests at once do not raise the total: every extra row needs its own experts, and 68 MoE layers run on the
-CPU. `--batch` lets several users share the model; it does not make it faster.
+More requests at once do not raise the total: every extra row needs its own experts, and the misses of the 31 MoE
+layers in blocks 0-67 run on the CPU. `--batch` lets several users share the model; it does not make it faster.
 
 ## Requirements
 
@@ -120,7 +120,7 @@ no VRAM.
 
 | engine flag | in the config | meaning |
 |---|---|---|
-| `--n-cpu-moe 68` | yes | the routed experts of the first 68 MoE layers stay in host RAM (read by the CPU or cached on the card) |
+| `--n-cpu-moe 68` | yes | the routed experts of blocks 0-67 (31 of the 40 MoE layers; the flag counts blocks, as in llama.cpp) stay in host RAM (read by the CPU or cached on the card) |
 | `--cache all` | yes | a VRAM cache of hot experts for those layers (measured: 123 slots per layer alone, 111 with `--batch 4`, under a 29,346 MiB cap) |
 | `--pin` | yes | page-locks the host expert ranges that fit (see Requirements) |
 | `--pin-reserve-mib N` | 8192 | host RAM `--pin` leaves free |
@@ -153,7 +153,9 @@ by single-token decode steps, while a fresh read builds it from one prompt chunk
 order. Measured: turn 1 6/6 identical in both modes; turn 2 with `on`, 4 of 6 conversations differed (first
 difference at token 21 or 61, the same two prompts solo and batched); with `off`, 12/12 identical. The shipped config
 uses `off` so that served output equals the CLI exactly. Set `on` if faster follow-ups matter more than that. Sessions
-that hold a picture are never reused in either mode.
+that hold a picture are never reused in either mode. (`serve/server.py` still sends upstream Strata's `img_keys` for
+picture-aware checkpoints, #2228; the Krait engine ignores that key, `src/nemotron_h/nh_engine.cu`, and refuses
+reuse for any session holding a picture.)
 
 ### Pictures
 
