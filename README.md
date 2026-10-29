@@ -4,9 +4,9 @@
 
 <h1 align="center">Krait: fast local inference for NVIDIA Nemotron 3.5 Super</h1>
 
-<p align="center"><b>Run Nemotron 3.5 Super 120B locally on one 32 GB GPU such as an RTX 5090: 1.6x llama.cpp's decode speed (greedy), token-exact to llama.cpp b11806 on Unsloth Q4.</b></p>
+<p align="center"><b>Run Nemotron 3.5 Super 120B locally on one 32 GB GPU such as an RTX 5090: 1.6x llama.cpp's decode speed (greedy), matches the llama.cpp b11806 golden capture (32 prompts, logits bit-identical) on UD-Q4_K_XL.</b></p>
 
-<p align="center"><sub>Greedy output matches llama.cpp b11806 on Unsloth's UD-Q4_K_XL files token for token (32/32 test prompts). The claim does not cover NVIDIA's original weights or other quantizations, and it is not a measure of answer quality.</sub></p>
+<p align="center"><sub>Exactness is against a golden capture from a reference tool built on llama.cpp b11806, on Unsloth's UD-Q4_K_XL files: 32/32 test prompts, 42,075/42,075 logits rows bit-identical, measured on one machine. It is not a free-running match with <code>llama-server</code>, whose greedy text drifts apart after 40 to 197 tokens (<a href="docs/KRAIT.md#correctness">the caveat</a>). The claim does not cover NVIDIA's original weights or other quantizations, and it is not a measure of answer quality.</sub></p>
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-5cf03a?style=flat-square" alt="License: MIT"></a>
@@ -22,7 +22,7 @@ Mamba-2 / attention / mixture-of-experts layers.
 
 Krait is a Nemotron 3.5 Super inference engine with an OpenAI-compatible server, for running the model as a local LLM.
 It runs **NVIDIA Nemotron 3.5 Super VL 120B-A12B** (GGUF architecture `nemotron_h_moe`, Unsloth's UD-Q4_K_XL GGUF)
-on a single 32 GB NVIDIA card such as an RTX 5090, with the routed experts of most layers in host RAM. Its engine,
+on a single 32 GB NVIDIA card such as an RTX 5090, with the routed experts in host RAM. Its engine,
 `krait-engine`, runs on llama.cpp's ggml kernels (b11806) with its own graph, expert cache, scheduler and MTP
 speculation. It serves text and pictures over the OpenAI and Anthropic APIs, with up to 4 requests at once.
 
@@ -95,16 +95,18 @@ flowchart LR
     D -->|greedy tokens| S
 ```
 
-The GPU holds the rest of the weights and a cache of the most-used experts. The routed experts of the 31 MoE layers among
-blocks 0-67 (`--n-cpu-moe 68` counts blocks, as in llama.cpp; the model has 88 blocks, 40 of them MoE) live in page-locked host RAM; the CPU reads those that are not in the cache. More details:
-[docs/KRAIT.md](docs/KRAIT.md).
+The GPU holds the rest of the weights and a cache of the most-used experts. With `--cache all` (the shipped config) the
+routed experts of all 40 MoE layers live in page-locked host RAM. `--n-cpu-moe 68` (it counts blocks, as in llama.cpp;
+the model has 88 blocks, 40 of them MoE) only picks the numerics: the 31 MoE layers in blocks 0-67 follow llama.cpp's
+CPU numerics, and the CPU computes their experts that are not in the cache; the other 9 follow its GPU numerics, and
+their missing experts are uploaded to the card over PCIe. More details: [docs/KRAIT.md](docs/KRAIT.md).
 
 ## Requirements
 
 - **GPU:** an NVIDIA GPU with 32 GB of VRAM (tested: RTX 5090, sm_120 only) and a CUDA toolkit that supports it (sm_120
   needs CUDA 12.8 or newer; tested with 12.9). The engine refuses to start, and says why, if its expert cache does not
   fit; cards with less VRAM are untested.
-- **Host RAM:** the engine keeps the routed experts of the MoE layers in blocks 0-67 (31 of the 40) in RAM. Measured: engine resident set 81.3-81.8 GiB, of
+- **Host RAM:** with `--cache all` the engine keeps the routed experts of all 40 MoE layers in RAM. Measured: engine resident set 81.3-81.8 GiB, of
   which `--pin` page-locks 72,261.3 MiB; tested only with 116,713 MiB of RAM visible to Linux. Before pinning, the
   engine checks the RAM available to it and locks only what fits while leaving `--pin-reserve-mib` (default 8,192 MiB)
   free; if not everything fits it says so and runs with the rest unpinned (slower).
@@ -176,10 +178,11 @@ code (untested).
 
 ### `--prefix-reuse`
 
-The shipped config (`krait/config.json`) uses `--prefix-reuse off`: every request reads its whole prompt, so served
-greedy output equals the CLI token for token. `--prefix-reuse on` keeps a conversation's state between turns and reads
-only the new tokens. Follow-ups are faster, but the output is not bit-identical to a fresh read (measured: 4 of 6 second
-turns differed; with `off`, 12/12 identical). Sessions that hold a picture are never reused.
+The engine's default is `--prefix-reuse on`; the shipped config (`krait/config.json`) sets `off`: every request reads
+its whole prompt, so served greedy output equals Krait's own CLI token for token (served and `--batch` output is checked
+against Krait's CLI, not against llama.cpp, which has no batched rows mode to compare with). `--prefix-reuse on` keeps
+a conversation's state between turns and reads only the new tokens. Follow-ups are faster, but the output is not
+bit-identical to a fresh read (measured: 4 of 6 second turns differed; with `off`, 12/12 identical). Sessions that hold a picture are never reused.
 
 ## Coming from Strata?
 
@@ -193,13 +196,13 @@ what is called something else:
 | Strata's engine | `krait-engine` (src/nemotron_h/), on llama.cpp b11806's ggml |
 | `http://127.0.0.1:8080/v1` | `http://127.0.0.1:8095/v1` (`PORT` to change it) |
 | `STRATA_API_KEY` / `"api_key"` | `KRAIT_API_KEY` (passed on to the same server as `STRATA_API_KEY`) |
-| `--expert-cache N` / `auto` (VRAM expert cache) | `--cache all`, sized from `--vram-limit-mib` or the free VRAM minus `--vram-reserve-mib` |
+| `--expert-cache N` / `auto` (VRAM expert cache) | `--cache all` (a VRAM cache for all 40 MoE layers, whose routed experts all stay in host RAM), sized from `--vram-limit-mib` or the free VRAM minus `--vram-reserve-mib` |
 | `--vram-reserve-mib` | `--vram-reserve-mib` (default 2,048) or a hard cap with `--vram-limit-mib` |
-| experts in RAM / `--mmap-experts` | `--n-cpu-moe 68` (routed experts of the 31 MoE layers in blocks 0-67 in RAM) + `--pin` (page-locked), `--pin-reserve-mib` |
+| experts in RAM / `--mmap-experts` | `--cache all` (routed experts of all 40 MoE layers in RAM) + `--pin` (page-locked), `--pin-reserve-mib`; `--n-cpu-moe 68` picks the numerics only (llama.cpp's CPU path for the 31 MoE layers in blocks 0-67, its GPU path for the other 9) |
 | `--spec N --mtp` | `--spec mtp --spec-k 1 --spec-min-acc 0.6` (the model's own MTP block; greedy requests only) |
 | `--batch` | `--batch 2..4` (rows mode, no MTP in batch slots) |
 | `--max-context` / `--context` | `--max-context 32768` |
-| `--prompt-cache` (conversation reuse) | `--prefix-reuse on\|off` (off by default, so output stays token-exact) |
+| `--prompt-cache` (conversation reuse) | `--prefix-reuse on\|off` (the engine default is `on`; the shipped `krait/config.json` sets `off`, so served output equals Krait's own CLI token for token) |
 | `--vision` (`strata-vision`) | the `vision` section of `krait/config.json` (`krait-vision`, the same encoder, on the CPU) |
 | `strata-<model>.json` | `krait/config.json` + your own `krait.local.json` |
 

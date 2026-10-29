@@ -1,6 +1,6 @@
 #!/bin/sh
 # Build the Strata images of one release from its engine packages and, only with --push, push them to the registry.
-# Upstream Strata's GitHub Actions workflow (docker-images.yml, not carried in Krait) runs this script once per flavor; you can run it by hand too.
+# Upstream Strata runs this script from a GitHub Actions workflow (not carried in Krait); you can run it by hand too.
 #
 #   docker/publish.sh --release-tag v0.2.2                        # builds every flavor the release has a package for; pushes nothing
 #   docker/publish.sh --release-tag v0.2.2 --flavors cuda13,cuda12 --push

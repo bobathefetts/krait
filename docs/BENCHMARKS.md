@@ -77,7 +77,8 @@ Several requests at once (`--batch 4`; batch slots decode without MTP), aggregat
 
 Engine line protocol, concurrent sessions (no MTP in slots), total tok/s: c = 1 / 2 / 3 / 4 -> 19.84 / 22.81 / 23.53 /
 23.78 (steady state 19.77 / 23.56 / 24.66 / 25.09). More requests at once do not raise the total: each extra row needs
-its own experts, and the misses of the 31 MoE layers in blocks 0-67 run on the CPU.
+its own experts; the misses of the 31 MoE layers in blocks 0-67 run on the CPU, and the misses of the other 9 MoE layers
+are synchronous PCIe uploads to the card, so both grow with every extra row.
 
 ## Pictures (CPU encoder)
 

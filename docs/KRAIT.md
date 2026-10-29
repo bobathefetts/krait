@@ -3,7 +3,7 @@
 Krait is based on Strata by Niko1221 (github.com/Niko1221/Strata, MIT).
 
 This port runs **NVIDIA Nemotron 3.5 Super VL 120B-A12B** (GGUF architecture `nemotron_h_moe`: Mamba-2 + attention
-without RoPE + LatentMoE, one MTP block) on a single 32 GB NVIDIA card with the routed experts of most layers in host
+without RoPE + LatentMoE, one MTP block) on a single 32 GB NVIDIA card with the routed experts in host
 RAM. It has its own engine, `krait-engine` (src/nemotron_h/), built on llama.cpp's ggml kernels (b11806) with a
 graph, expert cache and scheduler of its own. The server (`serve/server.py`, OpenAI + Anthropic API, web page) and the
 vision encoder (upstream `strata-vision` on llama.cpp's mtmd, installed as `krait-vision`) are Strata's, with the
@@ -20,7 +20,7 @@ it. All of these were measured (raw numbers: [BENCHMARKS.md](BENCHMARKS.md#exact
 |---|---|
 | 32 test prompts, greedy, vs the golden capture | 32/32 token-identical; 42,075/42,075 logits rows bit-identical (also with MTP speculation on) |
 | speculation on vs off (`--spec-check`, every logits row hashed) | identical for MTP k = 1, 2, 3 and n-gram k = 1, 2, 3 |
-| server: served greedy tokens vs the CLI | solo 6/6, `--batch 4` 6/6, 1-4 concurrent sessions all identical, HTTP 13/13 |
+| server: served greedy tokens vs Krait's own CLI (not llama.cpp) | solo 6/6, `--batch 4` 6/6, 1-4 concurrent sessions all identical, HTTP 13/13 |
 | pictures: engine vs `llama-mtmd-cli` (2 images, solo and batched) | 4/4 identical |
 
 This is exactness against the golden capture, for greedy decoding. Against `llama-server` b11806, greedy text on 6 real
@@ -33,8 +33,9 @@ on real prompts from the CLI (llama.cpp b11806 on the same machine: 14.3 tok/s),
 prompt in 63.4 s. MTP speculation is used only for greedy requests decoded alone; batch slots and sampled requests
 decode without it, and sampled speed was not measured. Methods and every raw number: [BENCHMARKS.md](BENCHMARKS.md).
 
-More requests at once do not raise the total: every extra row needs its own experts, and the misses of the 31 MoE
-layers in blocks 0-67 run on the CPU. `--batch` lets several users share the model; it does not make it faster.
+More requests at once do not raise the total: every extra row needs its own experts. The misses of the 31 MoE layers in
+blocks 0-67 run on the CPU, and the misses of the other 9 MoE layers are synchronous PCIe uploads to the card; both grow
+with every extra row. `--batch` lets several users share the model; it does not make it faster.
 
 ## Requirements
 
@@ -120,8 +121,8 @@ no VRAM.
 
 | engine flag | in the config | meaning |
 |---|---|---|
-| `--n-cpu-moe 68` | yes | the routed experts of blocks 0-67 (31 of the 40 MoE layers; the flag counts blocks, as in llama.cpp) stay in host RAM (read by the CPU or cached on the card) |
-| `--cache all` | yes | a VRAM cache of hot experts for those layers (measured: 123 slots per layer alone, 111 with `--batch 4`, under a 29,346 MiB cap) |
+| `--n-cpu-moe 68` | yes | picks the numerics, not where the experts live: the 31 MoE layers in blocks 0-67 (the flag counts blocks, as in llama.cpp) follow llama.cpp's CPU numerics, and the CPU computes their cache misses; the other 9 follow its GPU numerics, and their misses are uploaded to the card over PCIe |
+| `--cache all` | yes | the routed experts of all 40 MoE layers stay in host RAM, with a VRAM cache of hot experts for all 40 (31 lo + 9 hi pools; measured: 123 slots per layer alone, 111 with `--batch 4`, under a 29,346 MiB cap) |
 | `--pin` | yes | page-locks the host expert ranges that fit (see Requirements) |
 | `--pin-reserve-mib N` | 8192 | host RAM `--pin` leaves free |
 | `--spec mtp --spec-k 1 --spec-min-acc 0.6` | yes | MTP speculation with the model's own draft block, for greedy requests decoded alone; drafting pauses while the acceptance average is under 0.6 |
@@ -152,7 +153,7 @@ reads the new tokens. With `off`, every request reads its whole prompt from scra
 by single-token decode steps, while a fresh read builds it from one prompt chunk, so the float sums run in a different
 order. Measured: turn 1 6/6 identical in both modes; turn 2 with `on`, 4 of 6 conversations differed (first
 difference at token 21 or 61, the same two prompts solo and batched); with `off`, 12/12 identical. The shipped config
-uses `off` so that served output equals the CLI exactly. Set `on` if faster follow-ups matter more than that. Sessions
+uses `off` so that served output equals Krait's own CLI exactly. Set `on` if faster follow-ups matter more than that. Sessions
 that hold a picture are never reused in either mode. (`serve/server.py` still sends upstream Strata's `img_keys` for
 picture-aware checkpoints, #2228; the Krait engine ignores that key, `src/nemotron_h/nh_engine.cu`, and refuses
 reuse for any session holding a picture.)

@@ -153,8 +153,9 @@ class Document(unittest.TestCase):
 
 
 class Publishing(unittest.TestCase):
-    """The scripts and the workflow that publish the images (docker/publish.sh, docker/fetch-engines.py, .github/workflows/docker-images.yml)."""
-    WORKFLOW = ROOT / ".github" / "workflows" / "docker-images.yml"
+    """The scripts that publish the images (docker/publish.sh, docker/fetch-engines.py). Krait carries no image workflow."""
+    WORKFLOW_NAME = "docker-images" + ".yml"     # split so that this file does not match its own search below
+    WORKFLOW = ROOT / ".github" / "workflows" / WORKFLOW_NAME
 
     @unittest.skipIf(SH is None, "needs sh")
     def test_publish_script_parses_and_defaults_to_not_pushing(self):
@@ -187,21 +188,24 @@ class Publishing(unittest.TestCase):
         for item in payload:
             self.assertTrue(any(item == p or item.startswith(p.rstrip("/") + "/") for p in listed), f"build.sh does not copy {item}")
 
-    @unittest.skipUnless((ROOT / ".github" / "workflows" / "docker-images.yml").exists(),
-                         "Krait does not carry upstream Strata's image workflow")
-    def test_workflow_is_manual_and_pushes_only_on_request(self):
-        data = yaml.safe_load(self.WORKFLOW.read_text(encoding="utf-8"))
-        triggers = data.get("on", data.get(True))            # YAML 1.1 reads a bare `on` as True
-        self.assertEqual(set(triggers), {"workflow_dispatch"})
-        inputs = triggers["workflow_dispatch"]["inputs"]
-        self.assertIn("release_tag", inputs)
-        self.assertFalse(inputs["push"]["default"])
-        self.assertEqual(data["permissions"], {"contents": "read"})
-        self.assertEqual(data["jobs"]["image"]["permissions"], {"contents": "read", "packages": "write"})
-        text = self.WORKFLOW.read_text(encoding="utf-8")
-        self.assertIn("ghcr.io/niko1221/strata", text)
-        self.assertIn("docker/publish.sh", text)
-        self.assertNotIn("${{ secrets.GITHUB_TOKEN }}\" |", text)   # the token goes through an env variable, not into the command line
+    def test_krait_carries_no_image_workflow(self):
+        """Krait publishes no images: upstream's workflow (it pushed to upstream's ghcr.io/niko1221/strata) is absent, and no
+        document, script or workflow refers to it."""
+        self.assertFalse(self.WORKFLOW.exists(), self.WORKFLOW)
+        places = [ROOT / "docs", ROOT / "docker", ROOT / ".github", ROOT / "krait", ROOT / "packaging"]
+        files = [p for p in ROOT.glob("*.md")]
+        for place in places:
+            if place.is_dir():
+                files += [p for p in place.rglob("*") if p.is_file()]
+        mentions = []
+        for p in files:
+            try:
+                text = p.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError):
+                continue
+            if self.WORKFLOW_NAME in text:
+                mentions.append(str(p.relative_to(ROOT)))
+        self.assertEqual(mentions, [])
 
 
 if __name__ == "__main__":

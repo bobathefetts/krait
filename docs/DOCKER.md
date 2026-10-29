@@ -306,28 +306,18 @@ builds from source see [AMD_HIP.md](AMD_HIP.md) and [INTEL.md](INTEL.md); then p
 
 ## Publishing the images (for maintainers)
 
-> **Krait:** this section describes upstream Strata's image publishing. Krait does not carry the
-> `docker-images.yml` workflow (it pushed to upstream's `ghcr.io/niko1221/strata`), and Krait publishes no images. For the
-> Krait stack use a local build: [docker/krait](../docker/krait) (`krait:local`).
+> **Krait:** this section describes upstream Strata's image publishing. Krait carries no image workflow and publishes no
+> images; the images below are upstream's `ghcr.io/niko1221/strata`. For the Krait stack use a local build:
+> [docker/krait](../docker/krait) (`krait:local`).
 
-The images are built from the **engine packages of a release**, never from a build on the runner, so an image holds exactly the
-files the signed update feed names. Nothing publishes by itself: a maintainer starts the workflow, after the owner's OK.
+Upstream builds the images from the **engine packages of a release**, never from a local engine build, so an image holds
+exactly the files the signed update feed names. Nothing publishes by itself.
 
-1. Make the release first (its `strata-feed.json`, `strata-feed.json.sig` and the engine archives must be on the GitHub release).
-2. GitHub, **Actions, Docker images, Run workflow** ([.github/workflows/docker-images.yml](../.github/workflows/docker-images.yml); the file has to be on
-   the default branch to show up). Inputs: the release tag (`v0.2.2`), the flavors (empty: every flavor the release has a package
-   for), **push** and **latest**. Run it once with **push off**: it builds every image and publishes nothing (a dry run).
-3. Run it again with **push on**. It logs in to `ghcr.io` with the job's `GITHUB_TOKEN` (`packages: write`) and pushes
-   `ghcr.io/niko1221/strata:0.2.2-<flavor>` and `latest-<flavor>`. Turn **latest** off for a pre-release.
-4. The first push creates each package as private. In the repository's Packages, open every package, **Package settings, Change
-   visibility, Public**, and check it is linked to the repository (the image carries the `org.opencontainers.image.source` label).
-5. Check one pull from a computer that is not logged in: `docker pull ghcr.io/niko1221/strata:0.2.2-cuda13`.
-
-For each flavor the job runs [docker/fetch-engines.py](../docker/fetch-engines.py), which reads the release's signed feed (the
-Ed25519 key in `strata_control/update_keys.json`), downloads the package, and checks the archive's size and SHA-256, the manifest
-hash, the package signature and every file's hash, exactly as `strata update` does; a package that fails stops the job before
-anything is built. [docker/build.sh](../docker/build.sh) then builds the image (and checks the package again inside the build), and
-the job starts the image once to see that the Terminal inside it runs.
+[docker/publish.sh](../docker/publish.sh) does the work on a Linux computer with Docker: for each flavor it runs
+[docker/fetch-engines.py](../docker/fetch-engines.py), which reads the release's signed feed (the Ed25519 key in
+`strata_control/update_keys.json`), downloads the package, and checks the archive's size and SHA-256, the manifest hash,
+the package signature and every file's hash, exactly as `strata update` does; a package that fails stops before anything
+is built. [docker/build.sh](../docker/build.sh) then builds the image (and checks the package again inside the build).
 
 | Flavor (tag suffix) | Engine package in the release feed |
 | --- | --- |
@@ -338,9 +328,9 @@ the job starts the image once to see that the Terminal inside it runs.
 | `rocm-gfx1151` | `linux-x86_64`, hip, variant `halo` (Strix Halo, gfx1151) |
 | `sycl` | `linux-x86_64`, sycl; **only when the feed lists one** (the 0.2.0-beta feed has none, so no Intel image is built from it) |
 
-A flavor the feed has no package for is left out, with a line in the log. The same steps run from a Linux computer with Docker:
-`docker/publish.sh --release-tag v0.2.2` builds everything and pushes nothing; add `--push` (after `docker login ghcr.io`) to publish.
-The images run on the runner without a graphics card, so the card checks (`docker/smoke-test.sh`) stay a manual step on a computer with the card.
+A flavor the feed has no package for is left out, with a line in the log. `docker/publish.sh --release-tag v0.2.2` builds
+everything and pushes nothing; `--push` (after `docker login ghcr.io`) publishes. The card checks (`docker/smoke-test.sh`)
+are a manual step on a computer with the card.
 
 ## Tested
 
